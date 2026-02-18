@@ -398,6 +398,121 @@ async def notion_bulk_save_health_logs(text: str) -> tuple[int, list[str]]:
 
     return saved, dates_saved
 
+# ─── Notion: 헬스 일지 JSON 기반 저장 ───────────────────
+async def extract_health_json(history: list[dict]) -> list[dict]:
+    """
+    대화 히스토리에서 헬스 기록을 JSON 배열로 추출 (Haiku + temperature=0).
+    반환: [{"date":"YYYY-MM-DD","breakfast":"","lunch":"","dinner":"","snack":"","workout":"","notes":""}]
+    """
+    today_str = date.today().isoformat()
+    conv_text = "\n".join(
+        f"{'사용자' if m['role']=='user' else '봇'}: {m['content']}"
+        for m in history
+    )
+    prompt = (
+        f"아래 대화에서 사용자가 직접 말한 운동/식단 기록만 추출해줘.\n"
+        f"봇의 안내 메시지, 질문 템플릿, '기록이 없네요' 같은 봇 응답은 완전히 무시해.\n"
+        f"없는 내용은 절대 지어내지 마. 언급이 없으면 빈 문자열(\"\")로 남겨.\n"
+        f"날짜가 명시되지 않으면 오늘({today_str})로 설정해.\n"
+        f"요일은 날짜에 맞게 계산해줘 (월/화/수/목/금/토/일).\n"
+        f"특기사항은 배열로, 항목별로 분리해줘.\n\n"
+        f"반드시 아래 JSON 배열 형식으로만 답해. 다른 설명 없이 JSON만:\n"
+        f'[{{"date":"YYYY-MM-DD","weekday":"월","workout_part":"","workout_weight":"","workout_time":"","condition":"","breakfast":"","lunch":"","dinner":"","snack":"","notes":[]}}]\n\n'
+        f"[대화]\n{conv_text}"
+    )
+    try:
+        response = await anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            temperature=0,
+            system="너는 대화에서 헬스 데이터를 정확히 추출하는 파서야. JSON 배열만 반환해.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        entries = json.loads(raw)
+        return entries if isinstance(entries, list) else []
+    except Exception as e:
+        print(f"[헬스 JSON 추출 오류] {e}")
+        return []
+
+def format_health_entry(entry: dict) -> str:
+    """JSON 딕셔너리 → 고정 포맷 문자열 (코드에서 포맷 결정, AI 관여 없음)"""
+    try:
+        d = entry.get("date", date.today().isoformat())
+        year, month, day = d.split("-")
+        date_label = f"{int(month)}월 {int(day)}일"
+    except Exception:
+        date_label = entry.get("date", "날짜미상")
+
+    weekday = entry.get("weekday", "")
+    header  = f"🗓️ {date_label} ({weekday})" if weekday else f"🗓️ {date_label}"
+
+    def val(k):
+        v = entry.get(k, "")
+        if isinstance(v, str):
+            v = v.strip()
+        return v if v else ""
+
+    lines = [
+        header,
+        "",
+        "🏋️ 운동 기록",
+        f"운동 부위/종목: {val('workout_part')}",
+        f"무게/세트/횟수: {val('workout_weight')}",
+        f"운동 시간대: {val('workout_time')}",
+        f"컨디션: {val('condition')}",
+        "",
+        "🍽️ 식단 기록",
+        f"아침: {val('breakfast')}",
+        f"점심: {val('lunch')}",
+        f"저녁: {val('dinner')}",
+        f"간식/야식: {val('snack')}",
+        "",
+        "⭐ 특기사항",
+    ]
+    notes = entry.get("notes", [])
+    if isinstance(notes, list) and notes:
+        for note in notes:
+            if note.strip():
+                lines.append(f"- {note.strip()}")
+    elif isinstance(notes, str) and notes.strip():
+        lines.append(f"- {notes.strip()}")
+    else:
+        lines.append("-")
+    return "\n".join(lines)
+
+async def notion_save_health_from_json(entries: list[dict]) -> tuple[int, list[str]]:
+    """JSON 엔트리 리스트를 Notion 헬스 DB에 저장. 반환: (저장 수, 날짜 목록)"""
+    if not notion or not NOTION_HEALTH_DB_ID:
+        return 0, []
+    saved = 0
+    dates_saved = []
+    for entry in entries:
+        log_date = entry.get("date", date.today().isoformat())
+        content  = format_health_entry(entry)
+        try:
+            await notion.pages.create(
+                parent={"database_id": NOTION_HEALTH_DB_ID},
+                properties={
+                    "이름": {"title": [{"text": {"content": f"헬스 일지 - {log_date}"}}]},
+                    "날짜": {"date": {"start": log_date}},
+                    "내용": {"rich_text": _rich_text(content)},
+                },
+                children=[{
+                    "object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": _rich_text(content)},
+                }]
+            )
+            saved += 1
+            dates_saved.append(log_date)
+        except Exception as e:
+            print(f"[Notion 헬스 일지 저장 오류] {log_date}: {e}")
+    return saved, dates_saved
+
 # ─── Notion: 할일 ─────────────────────────────────────
 async def notion_add_todo(title: str, due_date: str = "", priority: str = "중간") -> bool:
     """할일을 Notion DB에 추가 (프로퍼티: 이름/마감일/완료/우선순위)"""
@@ -734,33 +849,24 @@ async def generate_summary(channel_id: int, channel_name: str) -> str:
                 and len(last_asst["content"]) > 150):
             return last_asst["content"]  # 이미 나온 요약 재사용, Claude 재호출 없음
 
-    # ── 요약이 없으면 새로 생성 ──
+    # ── 헬스 채널: JSON 추출 후 코드에서 고정 포맷 생성 ──
+    if mode == "헬스":
+        entries = await extract_health_json(history)
+        if not entries:
+            return "오늘 기록된 헬스 데이터가 없어요."
+        return "\n\n---\n\n".join(format_health_entry(e) for e in entries)
+
+    # ── 그 외 채널: 텍스트 요약 ──
     today_str = date.today().strftime("%Y년 %m월 %d일")
     summary_prompts = {
-        "헬스": (
-            f"오늘({today_str}) 대화에서 사용자가 직접 입력한 운동/식단 기록 데이터만 추출해서 정리해줘.\n"
-            "봇의 안내 메시지, 질문 템플릿, '기록이 없네요' 같은 봇 응답은 완전히 무시해줘.\n"
-            "오직 사용자가 말한 실제 기록 내용에만 집중해줘. 없는 내용은 절대 지어내지 마.\n\n"
-            "아래 형식으로 정리해줘:\n\n"
-            f"{today_str}\n"
-            "아침 - [내용 또는 기록 없음]\n"
-            "점심 - [내용 또는 기록 없음]\n"
-            "저녁 - [내용 또는 기록 없음]\n"
-            "운동 - [부위 | 종목 세트×횟수]\n"
-            "특기사항 - [있으면 기재]\n\n"
-            "기록이 하나도 없으면 '오늘 기록된 데이터가 없어요'라고만 답해줘."
-        ),
         "일정": f"오늘({today_str}) 일정 대화 내용을 정리해줘. 완료한 일, 남은 할일, 내일 계획 순서로. 없는 내용은 지어내지 마.",
     }
     summary_request = summary_prompts.get(mode, f"오늘({today_str}) 대화 내용을 간단히 요약해줘. 없는 내용은 절대 지어내지 마.")
 
-    # 헬스 요약은 정확도가 중요하므로 Sonnet 사용, 나머지는 채널 기본 모델
-    summary_model = "claude-sonnet-4-6" if mode == "헬스" else get_model(mode)
-
     response = await anthropic.messages.create(
-        model=summary_model,
+        model=get_model(mode),
         max_tokens=1024,
-        temperature=0,   # 할루시네이션 방지: 창의성 OFF, 사실만
+        temperature=0,
         system=SYSTEM_PROMPTS[mode],
         messages=history + [{"role": "user", "content": summary_request}],
     )
@@ -921,17 +1027,32 @@ async def on_message(message: discord.Message):
 async def save_log(ctx):
     """오늘 대화를 AI가 요약해 Notion에 저장"""
     async with ctx.typing():
-        summary = await generate_summary(ctx.channel.id, ctx.channel.name)
-        result  = f"📝 **일지 저장 완료!**\n\n{summary}\n\n"
+        mode = get_channel_mode(ctx.channel.name)
 
-        # 헬스 채널: 날짜별 파싱 후 Notion에 각각 저장
-        if get_channel_mode(ctx.channel.name) == "헬스":
-            count, dates = await notion_bulk_save_health_logs(summary)
-            if count > 0:
-                dates_str = ", ".join(dates)
-                result += f"✅ Notion 헬스 일지 **{count}개** 저장 완료! ({dates_str})\n"
-            else:
-                result += "❌ Notion 저장 실패 (기록 데이터를 찾지 못했어요)\n"
+        if mode == "헬스":
+            # ── 헬스: JSON 추출 → 고정 포맷 → Notion 저장 ──
+            history = await get_today_history(ctx.channel.id)
+            if not history:
+                await ctx.send("❌ 오늘 대화 내용이 없어요!")
+                return
+            entries = await extract_health_json(history)
+            if not entries:
+                await ctx.send("❌ 저장할 헬스 기록을 찾지 못했어요. 대화에서 운동/식단 내용을 먼저 말해주세요!")
+                return
+            # 포맷 미리보기
+            formatted = "\n\n---\n\n".join(format_health_entry(e) for e in entries)
+            # Notion 저장
+            count, dates = await notion_save_health_from_json(entries)
+            dates_str = ", ".join(dates) if dates else "없음"
+            result = (
+                f"📝 **헬스 일지 저장 완료!**\n\n"
+                f"{formatted}\n\n"
+                f"{'✅' if count > 0 else '❌'} Notion **{count}개** 저장 ({dates_str})"
+            )
+        else:
+            # ── 그 외 채널: 텍스트 요약 저장 ──
+            summary = await generate_summary(ctx.channel.id, ctx.channel.name)
+            result  = f"📝 **일지 저장 완료!**\n\n{summary}"
 
         await send_long_message(ctx, result)
 
