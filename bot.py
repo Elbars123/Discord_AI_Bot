@@ -899,7 +899,8 @@ async def on_message(message: discord.Message):
             try:
                 # 헬스 채널: "기록" 관련 키워드 있을 때만 최근 3일 raw 데이터 주입
                 # 히스토리에는 원본 user_text만 저장 (Notion 데이터가 /저장 시 중복 저장 방지)
-                RECORD_KEYWORDS = ("기록", "불러", "최근", "지난", "뭐했", "보여줘", "얼마나", "어떻게 했")
+                RECORD_KEYWORDS = ("기록", "불러", "최근", "지난", "뭐했", "보여줘", "얼마나", "어떻게 했",
+                                   "먹을까", "뭐먹", "추천", "식단", "운동할까", "어떻게 할까", "뭐할까")
                 send_text = user_text
                 if (get_channel_mode(message.channel.name) == "헬스"
                         and notion
