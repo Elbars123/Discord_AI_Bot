@@ -315,258 +315,115 @@ def _rich_text(text: str) -> list:
 
 # 헬스 기록 자동 불러오기 키워드
 
-async def notion_get_health_logs(days: int = 14, compact: bool = False) -> str:
-    """
-    Notion 헬스 일지 DB에서 최근 N일 기록 조회.
-    compact=True: 코칭 컨텍스트용 압축 요약 (토큰 절감)
-    compact=False: 전체 내용 (상세 확인용)
-    """
-    if not notion:
-        print("[Notion 헬스 조회] notion 클라이언트 없음")
+def _prop_text(page: dict, key: str) -> str:
+    """Notion 페이지 프로퍼티에서 텍스트 값 추출 (title / rich_text 모두 지원)"""
+    prop = page["properties"].get(key, {})
+    if not prop:
         return ""
-    if not NOTION_HEALTH_DB_ID:
-        print("[Notion 헬스 조회] NOTION_HEALTH_DB_ID 미설정")
+    ptype = prop.get("type", "")
+    if ptype == "title":
+        items = prop.get("title", [])
+    elif ptype == "rich_text":
+        items = prop.get("rich_text", [])
+    else:
+        return ""
+    return "".join(r.get("text", {}).get("content", "") for r in items).strip()
+
+async def notion_get_health_logs(days: int = 7) -> str:
+    """
+    Notion 헬스 DB에서 최근 N일 기록 조회.
+    구조화된 프로퍼티(운동/아침/점심/저녁)에서 직접 읽어 raw 데이터 반환.
+    regex 파싱 없음 → 100% 정확.
+    """
+    if not notion or not NOTION_HEALTH_DB_ID:
+        print("[Notion 헬스 조회] 클라이언트 또는 DB ID 없음")
         return ""
     try:
         since = (date.today() - timedelta(days=days)).isoformat()
-        print(f"[Notion 헬스 조회] DB={NOTION_HEALTH_DB_ID[:8]}... since={since} compact={compact}")
         res = await notion.databases.query(
             database_id=NOTION_HEALTH_DB_ID,
             filter={"property": "날짜", "date": {"on_or_after": since}},
             sorts=[{"property": "날짜", "direction": "ascending"}],
         )
-        print(f"[Notion 헬스 조회] 결과 수: {len(res['results'])}개")
+        print(f"[Notion 헬스 조회] {len(res['results'])}개 (최근 {days}일)")
         if not res["results"]:
             return ""
 
-        logs = []
+        rows = []
         for page in res["results"]:
             date_obj = page["properties"].get("날짜", {}).get("date") or {}
             log_date = date_obj.get("start", "날짜미상")
 
-            # 페이지 본문 블록에서 내용 읽기
-            blocks = await notion.blocks.children.list(block_id=page["id"])
-            parts  = []
-            for block in blocks["results"]:
-                btype = block.get("type", "")
-                rich  = block.get(btype, {}).get("rich_text", [])
-                text  = "".join(r["text"]["content"] for r in rich)
-                if text.strip():
-                    parts.append(text)
-            content = "\n".join(parts) if parts else "내용 없음"
+            workout   = _prop_text(page, "운동")
+            breakfast = _prop_text(page, "아침")
+            lunch     = _prop_text(page, "점심")
+            dinner    = _prop_text(page, "저녁")
 
-            if compact:
-                # 압축 모드: 고정 포맷 라벨 기반 regex 추출
-                import re as _re
+            parts = [f"날짜: {log_date}"]
+            if workout:   parts.append(f"운동: {workout}")
+            if breakfast: parts.append(f"아침: {breakfast}")
+            if lunch:     parts.append(f"점심: {lunch}")
+            if dinner:    parts.append(f"저녁: {dinner}")
 
-                def extract(pattern, text, default=""):
-                    m = _re.search(pattern, text, _re.MULTILINE)
-                    if not m:
-                        return default
-                    val = m.group(1).strip()
-                    # 빈값 / 미기록 / "-" 등 제외
-                    return "" if val in ("", "-", "없음", "미기록", "해당없음") else val
+            rows.append(" | ".join(parts))
 
-                workout   = extract(r"운동 부위/종목:\s*(.+)", content)
-                weight    = extract(r"무게/세트/횟수:\s*(.+)", content)
-                work_time = extract(r"운동 시간대:\s*(.+)", content)
-                cond      = extract(r"컨디션:\s*(.+)", content)
-                breakfast = extract(r"아침:\s*(.+)", content)
-                lunch     = extract(r"점심:\s*(.+)", content)
-                dinner    = extract(r"저녁:\s*(.+)", content)
-                snack     = extract(r"간식/야식:\s*(.+)", content)
-                notes_raw = _re.findall(r"^-\s+(.+)", content, _re.MULTILINE)
-                notes     = [n.strip() for n in notes_raw if n.strip() and n.strip() != "-"]
-
-                parts_compact = []
-                if workout:
-                    line = f"운동: {workout}"
-                    if weight:
-                        line += f" ({weight})"
-                    if work_time:
-                        line += f" {work_time}"
-                    parts_compact.append(line)
-                if cond:
-                    parts_compact.append(f"컨디션: {cond}")
-
-                meals = []
-                for label, val in [("아침", breakfast), ("점심", lunch), ("저녁", dinner), ("간식", snack)]:
-                    if val:
-                        meals.append(f"{label}-{val}")
-                if meals:
-                    parts_compact.append("식단: " + " | ".join(meals))
-                if notes:
-                    parts_compact.append("특기: " + " / ".join(notes[:2]))  # 최대 2개
-
-                summary = " · ".join(parts_compact) if parts_compact else "기록 있음 (포맷 불일치)"
-                logs.append(f"{log_date}: {summary}")
-            else:
-                logs.append(f"[{log_date}]\n{content}")
-
-            print(f"[Notion 헬스 조회] {log_date} OK")
-
-        sep = "\n" if compact else "\n\n---\n\n"
-        return sep.join(logs)
+        return "\n".join(rows)
     except Exception as e:
-        print(f"[Notion 헬스 기록 조회 오류] {type(e).__name__}: {e}")
+        print(f"[Notion 헬스 조회 오류] {type(e).__name__}: {e}")
         return ""
 
-# ─── Notion: 헬스 일지 (날짜별 자동 분리 저장) ──────
-async def notion_bulk_save_health_logs(text: str) -> tuple[int, list[str]]:
+async def notion_save_health_structured(
+    log_date: str,
+    workout: str,
+    breakfast: str,
+    lunch: str,
+    dinner: str,
+    narrative: str,
+) -> str:
     """
-    헬스 요약 텍스트에서 날짜별 섹션을 파싱해 각각 Notion 페이지로 저장.
-    반환: (저장된 개수, 저장된 날짜 목록)
-    """
-    if not notion or not NOTION_HEALTH_DB_ID:
-        return 0, []
-
-    # "X월 Y일" 또는 "YYYY-MM-DD" 패턴으로 섹션 분리
-    date_re = re.compile(r'(\d{1,2}월\s*\d{1,2}일(?:\s*\([^)]*\))?|\d{4}-\d{2}-\d{2})')
-    parts   = date_re.split(text)
-    # parts = [before_first_date, date1, content1, date2, content2, ...]
-
-    year   = date.today().year
-    saved  = 0
-    dates_saved: list[str] = []
-
-    i = 1
-    while i + 1 <= len(parts) - 1:
-        raw_date = parts[i].strip()
-        content  = parts[i + 1].strip()
-        i += 2
-        if not content:
-            continue
-
-        # 날짜 파싱
-        try:
-            m = re.search(r'(\d{1,2})월\s*(\d{1,2})일', raw_date)
-            if m:
-                month, day = int(m.group(1)), int(m.group(2))
-                log_date   = f"{year}-{month:02d}-{day:02d}"
-            else:
-                log_date = raw_date  # 이미 YYYY-MM-DD 형식
-        except Exception:
-            log_date = date.today().isoformat()
-
-        try:
-            await notion.pages.create(
-                parent={"database_id": NOTION_HEALTH_DB_ID},
-                properties={
-                    "이름": {"title": [{"text": {"content": f"헬스 일지 - {log_date}"}}]},
-                    "날짜": {"date": {"start": log_date}},
-                },
-                children=[{
-                    "object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": _rich_text(f"[{raw_date}]\n{content}")},
-                }]
-            )
-            saved += 1
-            dates_saved.append(log_date)
-        except Exception as e:
-            print(f"[Notion 헬스 일지 저장 오류] {log_date}: {e}")
-
-    # 날짜 섹션이 없으면 오늘 날짜로 통째로 저장
-    if saved == 0 and text.strip():
-        today = date.today().isoformat()
-        try:
-            await notion.pages.create(
-                parent={"database_id": NOTION_HEALTH_DB_ID},
-                properties={
-                    "이름": {"title": [{"text": {"content": f"헬스 일지 - {today}"}}]},
-                    "날짜": {"date": {"start": today}},
-                },
-                children=[{
-                    "object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": _rich_text(text)},
-                }]
-            )
-            saved = 1
-            dates_saved.append(today)
-        except Exception as e:
-            print(f"[Notion 헬스 일지 저장 오류] {e}")
-
-    return saved, dates_saved
-
-async def notion_save_health_text(preview_text: str) -> tuple[int, list[str], list[str]]:
-    """
-    Sonnet이 작성한 텍스트 미리보기를 날짜별로 분리해 Notion에 저장.
-    각 블록은 '🗓️' 로 시작.  기존 날짜 → UPDATE, 없으면 CREATE.
+    헬스 기록을 구조화 프로퍼티 + 서술형 본문으로 저장.
+    기존 날짜 → UPDATE, 없으면 → CREATE.
+    반환: "created" | "updated" | "error"
     """
     if not notion or not NOTION_HEALTH_DB_ID:
-        return 0, [], []
+        return "error"
+    try:
+        props = {
+            "이름":  {"title": [{"text": {"content": f"헬스 일지 - {log_date}"}}]},
+            "날짜":  {"date": {"start": log_date}},
+            "운동":  {"rich_text": _rich_text(workout)},
+            "아침":  {"rich_text": _rich_text(breakfast)},
+            "점심":  {"rich_text": _rich_text(lunch)},
+            "저녁":  {"rich_text": _rich_text(dinner)},
+        }
+        children = [{"object": "block", "type": "paragraph",
+                     "paragraph": {"rich_text": _rich_text(narrative)}}] if narrative else []
 
-    import re as _re
-
-    # 🗓️ 기준으로 날짜별 블록 분리
-    blocks = _re.split(r"(?=🗓️)", preview_text.strip())
-    blocks = [b.strip() for b in blocks if b.strip() and "🗓️" in b]
-
-    if not blocks:
-        # 날짜 구분 없이 전체 텍스트를 오늘 날짜로 저장
-        blocks = [preview_text.strip()]
-
-    saved, created_dates, updated_dates = 0, [], []
-
-    for block in blocks:
-        # 날짜 추출: YYYY-MM-DD 형식
-        date_match = _re.search(r"(\d{4}-\d{2}-\d{2})", block)
-        if date_match:
-            log_date = date_match.group(1)
-        else:
-            # 한글 날짜 패턴 (예: 2월 10일)
-            kor = _re.search(r"(\d{1,2})월\s*(\d{1,2})일", block)
-            if kor:
-                m, d = int(kor.group(1)), int(kor.group(2))
-                log_date = date(date.today().year, m, d).isoformat()
-            else:
-                log_date = date.today().isoformat()
-
-        try:
-            res = await notion.databases.query(
-                database_id=NOTION_HEALTH_DB_ID,
-                filter={"property": "날짜", "date": {"equals": log_date}}
-            )
-            existing = res["results"]
-
-            if existing:
-                # UPDATE: 제목만 업데이트하고 기존 블록 삭제 후 새 블록 추가
-                page_id = existing[0]["id"]
-                await notion.pages.update(
-                    page_id=page_id,
-                    properties={
-                        "이름": {"title": [{"text": {"content": f"헬스 일지 - {log_date}"}}]},
-                    }
-                )
-                # 기존 블록 삭제 후 새 내용으로 교체
+        res = await notion.databases.query(
+            database_id=NOTION_HEALTH_DB_ID,
+            filter={"property": "날짜", "date": {"equals": log_date}}
+        )
+        if res["results"]:
+            page_id = res["results"][0]["id"]
+            await notion.pages.update(page_id=page_id, properties=props)
+            if children:
                 old_blocks = await notion.blocks.children.list(block_id=page_id)
                 for b in old_blocks["results"]:
                     await notion.blocks.delete(block_id=b["id"])
-                await notion.blocks.children.append(
-                    block_id=page_id,
-                    children=[{"object": "block", "type": "paragraph",
-                               "paragraph": {"rich_text": _rich_text(block)}}]
-                )
-                updated_dates.append(log_date)
-                print(f"[Notion 헬스 일지 업데이트] {log_date}")
-            else:
-                # CREATE: 이름 + 날짜만 속성으로, 내용은 본문 블록으로
-                await notion.pages.create(
-                    parent={"database_id": NOTION_HEALTH_DB_ID},
-                    properties={
-                        "이름": {"title": [{"text": {"content": f"헬스 일지 - {log_date}"}}]},
-                        "날짜": {"date": {"start": log_date}},
-                    },
-                    children=[{"object": "block", "type": "paragraph",
-                               "paragraph": {"rich_text": _rich_text(block)}}]
-                )
-                created_dates.append(log_date)
-                print(f"[Notion 헬스 일지 생성] {log_date}")
-
-            saved += 1
-        except Exception as e:
-            print(f"[Notion 헬스 일지 저장 오류] {log_date}: {e}")
-
-    return saved, created_dates, updated_dates
+                await notion.blocks.children.append(block_id=page_id, children=children)
+            print(f"[Notion 헬스 업데이트] {log_date}")
+            return "updated"
+        else:
+            await notion.pages.create(
+                parent={"database_id": NOTION_HEALTH_DB_ID},
+                properties=props,
+                children=children,
+            )
+            print(f"[Notion 헬스 생성] {log_date}")
+            return "created"
+    except Exception as e:
+        print(f"[Notion 헬스 저장 오류] {log_date}: {e}")
+        return "error"
 
 
 # ─── Notion: 할일 ─────────────────────────────────────
@@ -1037,17 +894,17 @@ async def on_message(message: discord.Message):
 
         async with message.channel.typing():
             try:
-                # 헬스 채널: 항상 압축 요약 주입 (코칭 품질 유지) + 상세 요청 시 전체 주입
+                # 헬스 채널: "기록" 관련 키워드 있을 때만 최근 3일 raw 데이터 주입
                 # 히스토리에는 원본 user_text만 저장 (Notion 데이터가 /저장 시 중복 저장 방지)
-                DETAIL_KEYWORDS = ("자세히", "전체", "다 보여", "상세", "풀로")
+                RECORD_KEYWORDS = ("기록", "불러", "최근", "지난", "뭐했", "보여줘", "얼마나", "어떻게 했")
                 send_text = user_text
-                if get_channel_mode(message.channel.name) == "헬스" and notion:
-                    detail = any(kw in user_text for kw in DETAIL_KEYWORDS)
-                    records = await notion_get_health_logs(14, compact=not detail)
+                if (get_channel_mode(message.channel.name) == "헬스"
+                        and notion
+                        and any(kw in user_text for kw in RECORD_KEYWORDS)):
+                    records = await notion_get_health_logs(3)
                     if records:
-                        label = "상세 기록" if detail else "요약 (코칭 참고용, 저장 대상 아님)"
                         send_text = (
-                            f"[정훈의 Notion 헬스 기록 최근 14일 — {label}]\n"
+                            f"[정훈의 최근 3일 헬스 기록 — 코칭 참고용]\n"
                             f"{records}\n\n"
                             f"---\n"
                             f"[정훈의 메시지]\n{user_text}"
@@ -1087,26 +944,31 @@ async def on_message(message: discord.Message):
 
 # ─── 헬스 저장 확인 버튼 UI ──────────────────────────
 class HealthSaveView(View):
-    """미리보기 확인 후 저장 or 취소 (텍스트 기반)"""
-    def __init__(self, preview_text: str, channel_id: int):
+    """구조화 데이터 미리보기 확인 후 저장 or 취소"""
+    def __init__(self, parsed: dict, narrative: str, channel_id: int):
         super().__init__(timeout=120)
-        self.preview_text = preview_text
-        self.channel_id   = channel_id
+        self.parsed     = parsed      # {date, workout, breakfast, lunch, dinner}
+        self.narrative  = narrative   # 서술형 본문
+        self.channel_id = channel_id
 
     @discord.ui.button(label="✅ 저장", style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
-        # 미리보기 텍스트를 그대로 Notion에 날짜별로 저장
-        count, created, updated = await notion_save_health_text(self.preview_text)
-        if count > 0:
+        result = await notion_save_health_structured(
+            log_date  = self.parsed.get("date", date.today().isoformat()),
+            workout   = self.parsed.get("workout", ""),
+            breakfast = self.parsed.get("breakfast", ""),
+            lunch     = self.parsed.get("lunch", ""),
+            dinner    = self.parsed.get("dinner", ""),
+            narrative = self.narrative,
+        )
+        if result in ("created", "updated"):
+            action = "✅ 새로 저장" if result == "created" else "🔄 덮어쓰기"
             await clear_history(self.channel_id)
-            lines = []
-            if created:
-                lines.append(f"✅ 새로 저장: {', '.join(created)}")
-            if updated:
-                lines.append(f"🔄 덮어쓰기: {', '.join(updated)}")
-            lines.append("🧹 히스토리 초기화 완료")
-            await interaction.edit_original_response(content="\n".join(lines), view=None)
+            await interaction.edit_original_response(
+                content=f"{action} 완료! ({self.parsed.get('date','')})\n🧹 히스토리 초기화 완료",
+                view=None
+            )
         else:
             await interaction.edit_original_response(
                 content="❌ Notion 저장 실패. Railway 로그를 확인해주세요.", view=None
@@ -1116,7 +978,7 @@ class HealthSaveView(View):
     @discord.ui.button(label="❌ 취소", style=discord.ButtonStyle.red)
     async def cancel(self, interaction: discord.Interaction, button: Button):
         await interaction.response.edit_message(
-            content="❌ 저장 취소됐어요. 계속 대화하거나 수정 후 다시 `/저장` 해주세요.", view=None
+            content="❌ 저장 취소됐어요. 수정 후 다시 `/저장` 해주세요.", view=None
         )
         self.stop()
 
@@ -1126,65 +988,100 @@ class HealthSaveView(View):
 
 # ─── 기본 커맨드 ──────────────────────────────────────
 @bot.command(name="저장")
-async def save_log(ctx):
-    """오늘 대화를 AI가 요약해 Notion에 저장"""
+async def save_log(ctx, *, content: str = ""):
+    """
+    헬스: /저장 운동:벤치80kg5x5 아침:오트밀 점심:닭가슴살 저녁:현미+연어
+    자유형식도 가능 — Haiku가 파싱해 구조화 후 미리보기 → 버튼 확인 → Notion 저장
+    """
     async with ctx.typing():
         mode = get_channel_mode(ctx.channel.name)
 
         if mode == "헬스":
-            # ── 헬스: Sonnet이 대화 이해 → 포맷대로 일지 작성 → 미리보기 → 버튼 확인 ──
-            history = await get_history(ctx.channel.id)
-            if not history:
-                await ctx.send("❌ 대화 내용이 없어요! 먼저 오늘 운동/식단 얘기를 해주세요.")
-                return
+            # 입력이 없으면 대화 히스토리에서 가져옴
+            if not content:
+                history = await get_history(ctx.channel.id)
+                if not history:
+                    await ctx.send(
+                        "❌ 저장할 내용이 없어요!\n"
+                        "사용법: `/저장 운동:벤치80kg5x5 아침:오트밀 점심:닭가슴살 저녁:현미+연어`"
+                    )
+                    return
+                raw_input = "\n".join(
+                    f"{'사용자' if m['role']=='user' else '봇'}: {m['content']}"
+                    for m in history
+                )
+            else:
+                raw_input = content
 
-            today_str = date.today().isoformat()
-            format_request = (
-                "지금까지 나눈 대화를 바탕으로 헬스 일지를 작성해줘.\n"
-                "사용자가 직접 말한 내용만 써. 없는 내용은 빈칸으로 두면 돼.\n"
-                "날짜가 여러 날이면 날짜별로 반복해서 써줘.\n\n"
-                "반드시 아래 포맷 그대로만 사용해:\n\n"
-                f"🗓️ [날짜] ([요일])\n\n"
-                "🏋️ 운동 기록\n"
-                "운동 부위/종목: \n"
-                "무게/세트/횟수: \n"
-                "운동 시간대: \n"
-                "컨디션: \n\n"
-                "🍽️ 식단 기록\n"
-                "아침: \n"
-                "점심: \n"
-                "저녁: \n"
-                "간식/야식: \n\n"
-                "⭐ 특기사항\n"
-                "- \n"
+            today = date.today().isoformat()
+            parse_prompt = (
+                f"아래 내용에서 헬스 기록을 추출해 JSON으로만 답해. 설명 없이 JSON만.\n"
+                f"날짜가 없으면 오늘({today})로 설정.\n"
+                f"없는 항목은 빈 문자열(\"\")로.\n\n"
+                f'{{"date":"YYYY-MM-DD","workout":"","breakfast":"","lunch":"","dinner":""}}\n\n'
+                f"[입력]\n{raw_input}"
             )
-
-            response = await anthropic.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2048,
+            resp = await anthropic.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
                 temperature=0,
-                system=SYSTEM_PROMPTS["헬스"],
-                messages=history + [{"role": "user", "content": format_request}],
+                messages=[{"role": "user", "content": parse_prompt}],
             )
-            preview = response.content[0].text
-
-            if "운동 기록" not in preview and "식단 기록" not in preview:
-                await ctx.send("❌ 저장할 헬스 기록을 찾지 못했어요. 대화에서 운동/식단 내용을 먼저 말해주세요!")
+            raw_json = resp.content[0].text.strip()
+            if "```" in raw_json:
+                raw_json = raw_json.split("```")[1].lstrip("json").strip()
+            try:
+                parsed = json.loads(raw_json)
+            except Exception:
+                await ctx.send("❌ 내용 파싱 실패. 더 명확하게 입력해주세요.\n예: `/저장 운동:벤치80kg 아침:오트밀 점심:닭가슴살 저녁:현미밥`")
                 return
 
-            # 날짜별로 파싱해서 HealthSaveView에 넘기기 위해 preview 텍스트 자체를 저장
-            view = HealthSaveView(preview, ctx.channel.id)
-            await send_long_message(
-                ctx,
-                f"📋 **저장 미리보기** — 맞으면 ✅ 저장, 틀리면 ❌ 취소 후 수정해주세요.\n\n{preview}",
-                view=view
+            # 서술형 본문 생성 (Haiku)
+            narrative_prompt = (
+                f"아래 헬스 기록을 자연스러운 한국어 일지로 2-3문장으로 써줘. 없는 내용은 언급하지 마.\n\n"
+                f"날짜: {parsed.get('date','')}\n"
+                f"운동: {parsed.get('workout','')}\n"
+                f"아침: {parsed.get('breakfast','')}\n"
+                f"점심: {parsed.get('lunch','')}\n"
+                f"저녁: {parsed.get('dinner','')}"
             )
+            narr_resp = await anthropic.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                temperature=0.3,
+                messages=[{"role": "user", "content": narrative_prompt}],
+            )
+            narrative = narr_resp.content[0].text.strip()
+
+            # 미리보기
+            preview_lines = [
+                f"📋 **저장 미리보기** ({parsed.get('date','')})",
+                f"🏋️ 운동: {parsed.get('workout','(없음)')}",
+                f"🍽️ 아침: {parsed.get('breakfast','(없음)')}",
+                f"   점심: {parsed.get('lunch','(없음)')}",
+                f"   저녁: {parsed.get('dinner','(없음)')}",
+                f"",
+                f"📝 일지:\n{narrative}",
+            ]
+            view = HealthSaveView(parsed, narrative, ctx.channel.id)
+            await ctx.send("\n".join(preview_lines), view=view)
             return
+
         else:
             # ── 그 외 채널: 텍스트 요약 저장 ──
             summary = await generate_summary(ctx.channel.id, ctx.channel.name)
             result  = f"📝 **일지 저장 완료!**\n\n{summary}"
             await send_long_message(ctx, result)
+
+@bot.command(name="기록")
+async def show_health_records(ctx, days: int = 7):
+    """/기록 [일수] — Notion 헬스 raw 데이터 출력 (Claude.ai 복붙용). 기본 7일"""
+    await ctx.send(f"📂 최근 {days}일 기록 불러오는 중...")
+    records = await notion_get_health_logs(days)
+    if not records:
+        await ctx.send("❌ 기록이 없거나 Notion 연결 오류예요.")
+        return
+    await send_long_message(ctx, f"📋 **최근 {days}일 헬스 기록 (raw)**\n\n{records}")
 
 @bot.command(name="노션테스트")
 async def notion_test(ctx):
