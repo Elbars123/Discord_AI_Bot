@@ -100,6 +100,10 @@ SYSTEM_PROMPTS = {
 - `/초기화` — 이 채널 대화 히스토리 삭제
 - `/히스토리` — 현재 저장된 대화 수 확인
 
+[과거 기록 자동 불러오기]
+"최근 기록 보여줘", "지난주 뭐했어", "기록 불러와" 같은 말을 하면 → Notion에서 자동으로 최근 7일 기록을 가져와서 너에게 전달해줘. 그러면 그걸 바탕으로 대화하면 돼.
+이 기능은 자동이라서 커맨드 없이도 돼. 사용자한테 "못한다"고 하지 마.
+
 🚫 절대 금지 사항 (이것만큼은 반드시 지켜):
 - "저장 중...", "기록 중...", "삭제 중...", "처리 중..." 같은 말 절대 금지 — 너는 실시간으로 아무것도 못 해
 - "저장했어요", "기록했어요", "삭제했어요" 같은 말 절대 금지 — 실제로 한 게 아니니까
@@ -318,35 +322,49 @@ HEALTH_LOAD_KEYWORDS = (
 
 async def notion_get_health_logs(days: int = 7) -> str:
     """Notion 헬스 일지 DB에서 최근 N일 기록 조회 후 텍스트로 반환"""
-    if not notion or not NOTION_HEALTH_DB_ID:
+    if not notion:
+        print("[Notion 헬스 조회] notion 클라이언트 없음")
+        return ""
+    if not NOTION_HEALTH_DB_ID:
+        print("[Notion 헬스 조회] NOTION_HEALTH_DB_ID 미설정")
         return ""
     try:
         since = (date.today() - timedelta(days=days)).isoformat()
+        print(f"[Notion 헬스 조회] DB={NOTION_HEALTH_DB_ID[:8]}... since={since}")
         res = await notion.databases.query(
             database_id=NOTION_HEALTH_DB_ID,
             filter={"property": "날짜", "date": {"on_or_after": since}},
             sorts=[{"property": "날짜", "direction": "ascending"}],
         )
+        print(f"[Notion 헬스 조회] 결과 수: {len(res['results'])}개")
         if not res["results"]:
             return ""
         logs = []
         for page in res["results"]:
-            date_obj  = page["properties"].get("날짜", {}).get("date") or {}
-            log_date  = date_obj.get("start", "날짜미상")
-            # 페이지 본문 블록 가져오기
-            blocks = await notion.blocks.children.list(block_id=page["id"])
-            parts  = []
-            for block in blocks["results"]:
-                btype = block.get("type", "")
-                rich  = block.get(btype, {}).get("rich_text", [])
-                text  = "".join(r["text"]["content"] for r in rich)
-                if text.strip():
-                    parts.append(text)
-            content = "\n".join(parts) if parts else "내용 없음"
+            date_obj = page["properties"].get("날짜", {}).get("date") or {}
+            log_date = date_obj.get("start", "날짜미상")
+
+            # 1) 페이지 속성의 "내용" rich_text 먼저 시도
+            content_prop = page["properties"].get("내용", {}).get("rich_text", [])
+            content = "".join(r["text"]["content"] for r in content_prop).strip()
+
+            # 2) 속성에 없으면 페이지 본문 블록에서 읽기
+            if not content:
+                blocks = await notion.blocks.children.list(block_id=page["id"])
+                parts  = []
+                for block in blocks["results"]:
+                    btype = block.get("type", "")
+                    rich  = block.get(btype, {}).get("rich_text", [])
+                    text  = "".join(r["text"]["content"] for r in rich)
+                    if text.strip():
+                        parts.append(text)
+                content = "\n".join(parts) if parts else "내용 없음"
+
+            print(f"[Notion 헬스 조회] {log_date}: {content[:30]}...")
             logs.append(f"[{log_date}]\n{content}")
         return "\n\n---\n\n".join(logs)
     except Exception as e:
-        print(f"[Notion 헬스 기록 조회 오류] {e}")
+        print(f"[Notion 헬스 기록 조회 오류] {type(e).__name__}: {e}")
         return ""
 
 # ─── Notion: 헬스 일지 (날짜별 자동 분리 저장) ──────
@@ -1101,6 +1119,37 @@ async def save_log(ctx):
             summary = await generate_summary(ctx.channel.id, ctx.channel.name)
             result  = f"📝 **일지 저장 완료!**\n\n{summary}"
             await send_long_message(ctx, result)
+
+@bot.command(name="노션테스트")
+async def notion_test(ctx):
+    """Notion 헬스 DB 연결 및 데이터 조회 테스트"""
+    if not notion:
+        await ctx.send("❌ Notion 클라이언트 없음 (NOTION_TOKEN 미설정)")
+        return
+    if not NOTION_HEALTH_DB_ID:
+        await ctx.send("❌ NOTION_HEALTH_DB_ID 미설정")
+        return
+    await ctx.send(f"🔍 Notion 헬스 DB 조회 중...\nDB ID: `{NOTION_HEALTH_DB_ID[:8]}...`")
+    try:
+        res = await notion.databases.query(
+            database_id=NOTION_HEALTH_DB_ID,
+            sorts=[{"property": "날짜", "direction": "descending"}],
+        )
+        count = len(res["results"])
+        if count == 0:
+            await ctx.send("⚠️ DB 연결 성공했지만 저장된 페이지가 0개예요!")
+            return
+        dates = []
+        for page in res["results"][:5]:
+            date_obj = page["properties"].get("날짜", {}).get("date") or {}
+            dates.append(date_obj.get("start", "날짜 없음"))
+        await ctx.send(
+            f"✅ Notion 헬스 DB 연결 성공!\n"
+            f"총 {count}개 페이지 발견\n"
+            f"최근 날짜: {', '.join(dates)}"
+        )
+    except Exception as e:
+        await ctx.send(f"❌ 오류 발생: `{type(e).__name__}: {e}`")
 
 @bot.command(name="초기화")
 async def reset_history(ctx):
