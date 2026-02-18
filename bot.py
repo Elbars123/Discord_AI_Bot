@@ -314,11 +314,6 @@ def _rich_text(text: str) -> list:
     return [{"type": "text", "text": {"content": text[:2000]}}]
 
 # 헬스 기록 자동 불러오기 키워드
-HEALTH_LOAD_KEYWORDS = (
-    "기록", "불러와", "불러오", "최근", "지난", "저번",
-    "얼마나", "뭐했", "어떻게 했", "운동 현황", "식단 현황",
-    "진행 상황", "돌아봐", "정리해줘", "보여줘", "확인해줘"
-)
 
 async def notion_get_health_logs(days: int = 7) -> str:
     """Notion 헬스 일지 DB에서 최근 N일 기록 조회 후 텍스트로 반환"""
@@ -963,30 +958,17 @@ async def on_message(message: discord.Message):
 
         async with message.channel.typing():
             try:
-                # 헬스 채널: 기록 관련 키워드 감지 → Notion에서 자동 불러오기
+                # 헬스 채널: 매 메시지마다 Notion 최근 14일 기록 주입 → Sonnet이 알아서 활용
                 injected_text = user_text
                 if get_channel_mode(message.channel.name) == "헬스" and notion:
-                    if any(kw in user_text for kw in HEALTH_LOAD_KEYWORDS):
-                        # "최근 X일" 파싱 (기본 7일)
-                        days = 7
-                        for num in range(30, 0, -1):
-                            if str(num) in user_text:
-                                days = num
-                                break
-                        records = await notion_get_health_logs(days)
-                        if records:
-                            injected_text = (
-                                f"[정훈의 최근 {days}일 헬스 기록 (Notion에서 불러옴)]\n"
-                                f"{records}\n\n"
-                                f"---\n"
-                                f"[정훈의 메시지]\n{user_text}"
-                            )
-                        else:
-                            injected_text = (
-                                f"{user_text}\n\n"
-                                f"(참고: Notion에 최근 {days}일 헬스 기록이 없어요. "
-                                f"`/저장`으로 기록을 먼저 쌓아야 해요!)"
-                            )
+                    records = await notion_get_health_logs(14)
+                    if records:
+                        injected_text = (
+                            f"[정훈의 Notion 헬스 기록 (최근 14일)]\n"
+                            f"{records}\n\n"
+                            f"---\n"
+                            f"[정훈의 메시지]\n{user_text}"
+                        )
 
                 reply = await get_ai_response(
                     message.channel.id,
