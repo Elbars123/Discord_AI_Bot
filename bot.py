@@ -251,6 +251,46 @@ def _rich_text(text: str) -> list:
     """Notion rich_text 블록 생성 (2000자 제한 대응)"""
     return [{"type": "text", "text": {"content": text[:2000]}}]
 
+# 헬스 기록 자동 불러오기 키워드
+HEALTH_LOAD_KEYWORDS = (
+    "기록", "불러와", "불러오", "최근", "지난", "저번",
+    "얼마나", "뭐했", "어떻게 했", "운동 현황", "식단 현황",
+    "진행 상황", "돌아봐", "정리해줘", "보여줘", "확인해줘"
+)
+
+async def notion_get_health_logs(days: int = 7) -> str:
+    """Notion 헬스 일지 DB에서 최근 N일 기록 조회 후 텍스트로 반환"""
+    if not notion or not NOTION_HEALTH_DB_ID:
+        return ""
+    try:
+        since = (date.today() - timedelta(days=days)).isoformat()
+        res = await notion.databases.query(
+            database_id=NOTION_HEALTH_DB_ID,
+            filter={"property": "날짜", "date": {"on_or_after": since}},
+            sorts=[{"property": "날짜", "direction": "ascending"}],
+        )
+        if not res["results"]:
+            return ""
+        logs = []
+        for page in res["results"]:
+            date_obj  = page["properties"].get("날짜", {}).get("date") or {}
+            log_date  = date_obj.get("start", "날짜미상")
+            # 페이지 본문 블록 가져오기
+            blocks = await notion.blocks.children.list(block_id=page["id"])
+            parts  = []
+            for block in blocks["results"]:
+                btype = block.get("type", "")
+                rich  = block.get(btype, {}).get("rich_text", [])
+                text  = "".join(r["text"]["content"] for r in rich)
+                if text.strip():
+                    parts.append(text)
+            content = "\n".join(parts) if parts else "내용 없음"
+            logs.append(f"[{log_date}]\n{content}")
+        return "\n\n---\n\n".join(logs)
+    except Exception as e:
+        print(f"[Notion 헬스 기록 조회 오류] {e}")
+        return ""
+
 # ─── Notion: 헬스 일지 ───────────────────────────────
 async def notion_save_health_log(summary: str) -> bool:
     """헬스 일지를 Notion DB에 저장 (프로퍼티: 이름/날짜/내용)"""
@@ -615,10 +655,35 @@ async def on_message(message: discord.Message):
 
         async with message.channel.typing():
             try:
+                # 헬스 채널: 기록 관련 키워드 감지 → Notion에서 자동 불러오기
+                injected_text = user_text
+                if get_channel_mode(message.channel.name) == "헬스" and notion:
+                    if any(kw in user_text for kw in HEALTH_LOAD_KEYWORDS):
+                        # "최근 X일" 파싱 (기본 7일)
+                        days = 7
+                        for num in range(30, 0, -1):
+                            if str(num) in user_text:
+                                days = num
+                                break
+                        records = await notion_get_health_logs(days)
+                        if records:
+                            injected_text = (
+                                f"[정훈의 최근 {days}일 헬스 기록 (Notion에서 불러옴)]\n"
+                                f"{records}\n\n"
+                                f"---\n"
+                                f"[정훈의 메시지]\n{user_text}"
+                            )
+                        else:
+                            injected_text = (
+                                f"{user_text}\n\n"
+                                f"(참고: Notion에 최근 {days}일 헬스 기록이 없어요. "
+                                f"`/저장`으로 기록을 먼저 쌓아야 해요!)"
+                            )
+
                 reply = await get_ai_response(
                     message.channel.id,
                     message.channel.name,
-                    user_text,
+                    injected_text,
                 )
                 await send_long_message(message.channel, reply)
 
