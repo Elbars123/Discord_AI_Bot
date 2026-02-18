@@ -43,7 +43,6 @@ NOTION_MEMO_DB_ID        = os.environ.get("NOTION_MEMO_DB_ID", "")
 GOOGLE_CALENDAR_ID      = os.environ.get("GOOGLE_CALENDAR_ID", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 
-LOG_DIR      = "logs"
 DB_PATH      = "history.db"
 MAX_HISTORY  = 60
 MAX_MSG_LEN  = 1000   # 입력 메시지 최대 길이 (초과 시 잘라냄)
@@ -76,8 +75,12 @@ SYSTEM_PROMPTS = {
 - `/초기화` — 이 채널 대화 히스토리 삭제
 - `/히스토리` — 현재 저장된 대화 수 확인
 
-사용자가 "오늘 기록 저장해줘" 같이 물으면 `/저장` 커맨드를 쓰라고 안내해줘.
-사용자가 "노션에 저장돼?" 같이 물으면 "네! `/저장` 입력하면 Notion 헬스 일지 DB에 자동으로 저장돼요 💪" 라고 안내해줘.
+🚫 절대 금지 사항 (이것만큼은 반드시 지켜):
+- "저장 중...", "기록 중...", "삭제 중...", "처리 중..." 같은 말 절대 금지 — 너는 실시간으로 아무것도 못 해
+- "저장했어요", "기록했어요", "삭제했어요" 같은 말 절대 금지 — 실제로 한 게 아니니까
+- 사용자가 "저장해줘", "삭제해줘", "정리해줘" 라고 하면 → 해당 커맨드(/저장, /초기화 등)를 안내만 해줘
+- 너는 Notion, 파일, 메모리에 직접 접근하는 능력이 없어. 커맨드를 통해서만 가능해
+- 기록 수정은 `/헬스수정 날짜 | 내용` 커맨드로만 가능해
 항상 한국어로 대화하고, 친근하고 동기부여되는 톤으로 말해줘.""",
 
     "번역": """너는 정훈의 전담 번역 어시스턴트야. Notion과 연동되어 있어서 번역할 때마다 자동으로 번역 기록 DB에 저장돼.
@@ -112,6 +115,11 @@ SYSTEM_PROMPTS = {
 - 업무와 개인 일정 균형 조언
 
 사용자가 "캘린더 연결됐어?" 같이 물어보면 "네, 구글 캘린더와 연동되어 있어요! `/오늘일정` 이나 `/일정추가`를 써보세요 📅" 라고 안내해줘.
+🚫 절대 금지 사항 (반드시 지켜):
+- "저장 중...", "추가 중...", "삭제 중...", "처리 중..." 같은 말 절대 금지
+- "저장했어요", "추가했어요", "삭제했어요" 같은 말 절대 금지 — 실제로 한 게 아니야
+- 사용자가 "저장해줘", "추가해줘", "삭제해줘" 라고 하면 → 해당 커맨드를 안내만 해줘
+- 할일 수정은 `/할일수정 기존이름 | 새이름` 커맨드로만 가능해. 사용자가 "수정해줘"라고 하면 안내해줘
 항상 한국어로 대화하고, 효율적이고 명확하게 답해줘.""",
 
     "default": """너는 정훈의 만능 AI 비서야. 구글 캘린더 및 Notion과 연동되어 있어.
@@ -137,13 +145,21 @@ SYSTEM_PROMPTS = {
 - `/할일추가 [내용]` — Notion 할일 DB에 추가
 - `/할일목록` — 미완료 할일 목록 조회
 - `/할일완료 [이름]` — 완료 처리
+- `/할일수정 [이름] | [새이름 또는 마감:날짜 또는 우선순위:높음]` — 할일 수정
 - `/메모 [제목] | [내용]` — Notion 메모 DB에 저장
+- `/메모수정 [제목] | [새 내용]` — 메모 내용 수정
 
 [채널별 특화 기능]
 - `#헬스` — 운동/식단 특화 + `/저장` 시 Notion 헬스 일지 저장
 - `#번역` — 번역 특화(Sonnet 모델) + 번역마다 Notion 자동 저장
 - `#일정` — 일정 특화 + 자연어 일정 캘린더 자동 감지
 
+🚫 절대 금지 사항 (반드시 지켜):
+- "저장 중...", "처리 중...", "삭제 중...", "추가 중..." 같은 진행형 표현 절대 금지
+- "저장했어요", "추가했어요", "삭제했어요", "수정했어요" 같은 완료형 표현 절대 금지
+- 너는 Notion, 캘린더, 파일에 직접 접근 불가능해. 커맨드를 통해서만 실제 저장/수정이 이루어져
+- 사용자가 저장/수정/삭제를 요청하면 → 해당 커맨드(/저장, /메모, /할일추가 등)를 안내해줘
+- "메모리에서 삭제할게", "기억에서 지울게" 같은 말도 금지 — 대화 히스토리는 /초기화 커맨드로만 삭제 가능해
 사용자가 뭘 할 수 있는지 물어보면 위의 커맨드 목록을 친절하게 안내해줘.
 항상 한국어로 대화해줘.""",
 }
@@ -188,6 +204,17 @@ def _get_history(channel_id: int) -> list[dict]:
         ).fetchall()
     return [{"role": r[0], "content": r[1]} for r in rows]
 
+def _get_today_history(channel_id: int) -> list[dict]:
+    """오늘 날짜의 대화만 가져오기 (요약/저장 시 사용)"""
+    today = date.today().isoformat()  # "2026-02-18"
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM conversation_history "
+            "WHERE channel_id = ? AND DATE(timestamp) = ? ORDER BY timestamp",
+            (channel_id, today)
+        ).fetchall()
+    return [{"role": r[0], "content": r[1]} for r in rows]
+
 def _add_message(channel_id: int, role: str, content: str):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -220,6 +247,9 @@ def _count_history(channel_id: int) -> int:
 
 async def get_history(channel_id: int):
     return await asyncio.to_thread(_get_history, channel_id)
+
+async def get_today_history(channel_id: int):
+    return await asyncio.to_thread(_get_today_history, channel_id)
 
 async def add_message(channel_id: int, role: str, content: str):
     await asyncio.to_thread(_add_message, channel_id, role, content)
@@ -487,6 +517,80 @@ async def notion_save_memo(title: str, content: str) -> bool:
         print(f"[Notion 메모 저장 오류] {e}")
         return False
 
+# ─── Notion: 수정 함수들 ──────────────────────────────
+async def notion_update_todo(old_title: str, new_title: str = "", due_date: str = "", priority: str = "") -> bool:
+    """할일 이름으로 검색해 내용 수정"""
+    if not notion or not NOTION_TODO_DB_ID:
+        return False
+    try:
+        res = await notion.databases.query(
+            database_id=NOTION_TODO_DB_ID,
+            filter={"property": "이름", "title": {"contains": old_title}}
+        )
+        if not res["results"]:
+            return False
+        page_id = res["results"][0]["id"]
+        props = {}
+        if new_title:
+            props["이름"] = {"title": [{"text": {"content": new_title}}]}
+        if due_date:
+            props["마감일"] = {"date": {"start": due_date}}
+        if priority:
+            props["우선순위"] = {"select": {"name": priority}}
+        if not props:
+            return False
+        await notion.pages.update(page_id=page_id, properties=props)
+        return True
+    except Exception as e:
+        print(f"[Notion 할일 수정 오류] {e}")
+        return False
+
+async def notion_update_memo(title: str, new_title: str = "", new_content: str = "") -> bool:
+    """메모 제목으로 검색해 내용 수정"""
+    if not notion or not NOTION_MEMO_DB_ID:
+        return False
+    try:
+        res = await notion.databases.query(
+            database_id=NOTION_MEMO_DB_ID,
+            filter={"property": "제목", "title": {"contains": title}}
+        )
+        if not res["results"]:
+            return False
+        page_id = res["results"][0]["id"]
+        props = {}
+        if new_title:
+            props["제목"] = {"title": [{"text": {"content": new_title}}]}
+        if new_content:
+            props["내용"] = {"rich_text": _rich_text(new_content)}
+        if not props:
+            return False
+        await notion.pages.update(page_id=page_id, properties=props)
+        return True
+    except Exception as e:
+        print(f"[Notion 메모 수정 오류] {e}")
+        return False
+
+async def notion_update_health_log(date_str: str, new_content: str) -> bool:
+    """날짜로 헬스 기록 검색해 내용 수정"""
+    if not notion or not NOTION_HEALTH_DB_ID:
+        return False
+    try:
+        res = await notion.databases.query(
+            database_id=NOTION_HEALTH_DB_ID,
+            filter={"property": "날짜", "date": {"equals": date_str}}
+        )
+        if not res["results"]:
+            return False
+        page_id = res["results"][0]["id"]
+        await notion.pages.update(
+            page_id=page_id,
+            properties={"내용": {"rich_text": _rich_text(new_content)}}
+        )
+        return True
+    except Exception as e:
+        print(f"[Notion 헬스 기록 수정 오류] {e}")
+        return False
+
 # ─── Google Calendar ──────────────────────────────────
 def _get_calendar_service():
     if not GOOGLE_AVAILABLE or not GOOGLE_CREDENTIALS_JSON or not GOOGLE_CALENDAR_ID:
@@ -613,9 +717,10 @@ SUMMARY_TRIGGER_KEYWORDS = (
 )
 
 async def generate_summary(channel_id: int, channel_name: str) -> str:
-    history = await get_history(channel_id)
+    # ── 오늘 대화만 가져오기 (이전 날 데이터 포함 방지) ──
+    history = await get_today_history(channel_id)
     if not history:
-        return "대화 내용이 없어요!"
+        return "오늘 대화 내용이 없어요! (어제 이전 기록은 `/저장`으로 저장되지 않아요)"
     mode = get_channel_mode(channel_name)
 
     # ── 핵심 로직: 대화 중에 이미 요약이 나왔으면 그걸 그대로 사용 ──
@@ -630,50 +735,38 @@ async def generate_summary(channel_id: int, channel_name: str) -> str:
             return last_asst["content"]  # 이미 나온 요약 재사용, Claude 재호출 없음
 
     # ── 요약이 없으면 새로 생성 ──
+    today_str = date.today().strftime("%Y년 %m월 %d일")
     summary_prompts = {
         "헬스": (
-            "대화에서 사용자가 직접 입력한 운동/식단 기록 데이터만 추출해서 날짜별로 정리해줘.\n"
+            f"오늘({today_str}) 대화에서 사용자가 직접 입력한 운동/식단 기록 데이터만 추출해서 정리해줘.\n"
             "봇의 안내 메시지, 질문 템플릿, '기록이 없네요' 같은 봇 응답은 완전히 무시해줘.\n"
-            "오직 사용자가 말한 실제 기록 내용에만 집중해줘.\n\n"
-            "날짜별로 아래 형식으로 정리해줘:\n\n"
-            "X월 Y일\n"
+            "오직 사용자가 말한 실제 기록 내용에만 집중해줘. 없는 내용은 절대 지어내지 마.\n\n"
+            "아래 형식으로 정리해줘:\n\n"
+            f"{today_str}\n"
             "아침 - [내용 또는 기록 없음]\n"
             "점심 - [내용 또는 기록 없음]\n"
             "저녁 - [내용 또는 기록 없음]\n"
             "운동 - [부위 | 종목 세트×횟수]\n"
             "특기사항 - [있으면 기재]\n\n"
-            "날짜가 여러 개면 각 날짜마다 이 형식으로 반복해줘. "
-            "기록이 하나도 없으면 '기록된 데이터가 없어요'라고만 답해줘."
+            "기록이 하나도 없으면 '오늘 기록된 데이터가 없어요'라고만 답해줘."
         ),
-        "일정": "오늘 일정 대화 내용을 정리해줘. 완료한 일, 남은 할일, 내일 계획 순서로.",
+        "일정": f"오늘({today_str}) 일정 대화 내용을 정리해줘. 완료한 일, 남은 할일, 내일 계획 순서로. 없는 내용은 지어내지 마.",
     }
-    summary_request = summary_prompts.get(mode, "오늘 대화 내용을 간단히 요약해줘.")
+    summary_request = summary_prompts.get(mode, f"오늘({today_str}) 대화 내용을 간단히 요약해줘. 없는 내용은 절대 지어내지 마.")
+
+    # 헬스 요약은 정확도가 중요하므로 Sonnet 사용, 나머지는 채널 기본 모델
+    summary_model = "claude-sonnet-4-6" if mode == "헬스" else get_model(mode)
+
     response = await anthropic.messages.create(
-        model=get_model(mode),
+        model=summary_model,
         max_tokens=1024,
+        temperature=0,   # 할루시네이션 방지: 창의성 OFF, 사실만
         system=SYSTEM_PROMPTS[mode],
         messages=history + [{"role": "user", "content": summary_request}],
     )
     return response.content[0].text
 
-# ─── 파일 저장 ────────────────────────────────────────
-def _write_file(filename: str, content: str):
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
-
-async def save_to_file(channel_name: str, summary: str) -> str:
-    today    = date.today().isoformat()
-    filename = f"{LOG_DIR}/{today}_{channel_name}.md"
-    content  = (
-        f"# {channel_name} 일지 - {today}\n\n"
-        f"{summary}\n\n"
-        f"---\n*저장 시각: {datetime.now().strftime('%H:%M:%S')}*\n"
-    )
-    await asyncio.to_thread(_write_file, filename, content)
-    return filename
-
 # ─── 초기화 ───────────────────────────────────────────
-os.makedirs(LOG_DIR, exist_ok=True)
 init_db()
 
 anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -826,11 +919,10 @@ async def on_message(message: discord.Message):
 # ─── 기본 커맨드 ──────────────────────────────────────
 @bot.command(name="저장")
 async def save_log(ctx):
-    """오늘 대화를 AI가 요약해 파일 & Notion에 저장"""
+    """오늘 대화를 AI가 요약해 Notion에 저장"""
     async with ctx.typing():
-        summary  = await generate_summary(ctx.channel.id, ctx.channel.name)
-        filename = await save_to_file(ctx.channel.name, summary)
-        result   = f"📝 **일지 저장 완료!**\n\n{summary}\n\n✅ 파일: `{filename}`\n"
+        summary = await generate_summary(ctx.channel.id, ctx.channel.name)
+        result  = f"📝 **일지 저장 완료!**\n\n{summary}\n\n"
 
         # 헬스 채널: 날짜별 파싱 후 Notion에 각각 저장
         if get_channel_mode(ctx.channel.name) == "헬스":
@@ -999,6 +1091,81 @@ async def complete_todo_cmd(ctx, *, title: str = None):
     else:
         await ctx.send(f"❌ '{title}' 할일을 찾지 못했어요. 이름을 다시 확인해주세요.")
 
+# ─── 수정 커맨드 ──────────────────────────────────────
+@bot.command(name="할일수정")
+async def update_todo_cmd(ctx, *, content: str = None):
+    """Notion 할일 수정. 예: /할일수정 기존이름 | 새이름 또는 /할일수정 이름 | 마감:2026-03-01 또는 /할일수정 이름 | 우선순위:높음"""
+    if not content or "|" not in content:
+        await ctx.send(
+            "❌ 형식을 맞춰주세요.\n"
+            "예시:\n"
+            "`/할일수정 기존이름 | 새이름`\n"
+            "`/할일수정 기존이름 | 마감:2026-03-01`\n"
+            "`/할일수정 기존이름 | 우선순위:높음`"
+        )
+        return
+    if not NOTION_TODO_DB_ID:
+        await ctx.send("❌ Notion 할일 DB가 설정되지 않았어요.")
+        return
+    parts     = content.split("|", 1)
+    old_title = parts[0].strip()
+    change    = parts[1].strip()
+
+    new_title = due_date = priority = ""
+    if change.startswith("마감:"):
+        due_date = change.replace("마감:", "").strip()
+    elif change.startswith("우선순위:"):
+        priority = change.replace("우선순위:", "").strip()
+    else:
+        new_title = change
+
+    ok = await notion_update_todo(old_title, new_title, due_date, priority)
+    if ok:
+        await ctx.send(f"✅ **{old_title}** 할일을 수정했어요!")
+    else:
+        await ctx.send(f"❌ '{old_title}' 할일을 찾지 못했어요. 이름을 다시 확인해주세요.")
+
+@bot.command(name="메모수정")
+async def update_memo_cmd(ctx, *, content: str = None):
+    """Notion 메모 수정. 예: /메모수정 기존제목 | 새 내용"""
+    if not content or "|" not in content:
+        await ctx.send("❌ 형식을 맞춰주세요.\n예: `/메모수정 기존제목 | 새로운 내용`")
+        return
+    if not NOTION_MEMO_DB_ID:
+        await ctx.send("❌ Notion 메모 DB가 설정되지 않았어요.")
+        return
+    parts   = content.split("|", 1)
+    title   = parts[0].strip()
+    new_val = parts[1].strip()
+
+    # 제목 변경인지 내용 변경인지 구분: "제목:" 접두어가 있으면 제목 변경
+    if new_val.startswith("제목:"):
+        ok = await notion_update_memo(title, new_title=new_val.replace("제목:", "").strip())
+    else:
+        ok = await notion_update_memo(title, new_content=new_val)
+    if ok:
+        await ctx.send(f"✅ **{title}** 메모를 수정했어요!")
+    else:
+        await ctx.send(f"❌ '{title}' 메모를 찾지 못했어요. 제목을 다시 확인해주세요.")
+
+@bot.command(name="헬스수정")
+async def update_health_cmd(ctx, *, content: str = None):
+    """Notion 헬스 기록 수정. 예: /헬스수정 2026-02-18 | 수정할 내용"""
+    if not content or "|" not in content:
+        await ctx.send("❌ 형식을 맞춰주세요.\n예: `/헬스수정 2026-02-18 | 수정할 내용`")
+        return
+    if not NOTION_HEALTH_DB_ID:
+        await ctx.send("❌ Notion 헬스 DB가 설정되지 않았어요.")
+        return
+    parts       = content.split("|", 1)
+    date_str    = parts[0].strip()
+    new_content = parts[1].strip()
+    ok = await notion_update_health_log(date_str, new_content)
+    if ok:
+        await ctx.send(f"✅ **{date_str}** 헬스 기록을 수정했어요!")
+    else:
+        await ctx.send(f"❌ '{date_str}' 날짜의 헬스 기록을 찾지 못했어요. 날짜 형식(YYYY-MM-DD)을 확인해주세요.")
+
 # ─── 메모 커맨드 ──────────────────────────────────────
 @bot.command(name="메모")
 async def save_memo_cmd(ctx, *, content: str = None):
@@ -1049,9 +1216,16 @@ async def help_command(ctx):
 `/할일추가 [내용]` — Notion 할일 DB에 추가
 `/할일목록` — 미완료 할일 목록 조회
 `/할일완료 [할일명]` — 해당 할일 완료 처리
+`/할일수정 [이름] | [새이름]` — 할일 이름 변경
+`/할일수정 [이름] | 마감:2026-03-01` — 마감일 변경
+`/할일수정 [이름] | 우선순위:높음` — 우선순위 변경
 
 **📝 메모 커맨드:**
 `/메모 [제목] | [내용]` — Notion 메모 DB에 저장
+`/메모수정 [제목] | [새 내용]` — 메모 내용 수정
+
+**💪 헬스 커맨드:**
+`/헬스수정 2026-02-18 | [수정 내용]` — 특정 날짜 헬스 기록 수정
 
 `/도움말` — 이 메시지"""
     await send_long_message(ctx, help_text)
