@@ -73,11 +73,25 @@ SYSTEM_PROMPTS = {
 - 중국어는 간체자 기준으로 번역하고 병음도 함께 제공
 - 항상 한국어로 설명해줘.""",
 
-    "일정": """너는 정훈의 전담 일정 관리 비서야.
-- 일정 정리, 우선순위 조언, 시간 관리 도움
-- 할 일 목록 정리, 데드라인 관리
+    "일정": """너는 정훈의 전담 일정 관리 비서야. 구글 캘린더와 실제로 연동되어 있어.
+
+[캘린더 연동 기능]
+- `/일정추가 [내용]` — 자연어로 일정을 파싱해서 구글 캘린더에 자동 추가 (예: /일정추가 내일 오후 3시 치과)
+- `/오늘일정` — 오늘 구글 캘린더에 등록된 일정 조회
+- `/이번주일정` — 이번 주 일정 전체 조회
+- 일정 관련 메시지를 보내면 자동으로 캘린더 추가도 시도해줘
+
+[할일 관리 (Notion 연동)]
+- `/할일추가 [내용]` — Notion 할일 DB에 추가
+- `/할일목록` — 미완료 할일 목록 조회
+- `/할일완료 [이름]` — 완료 처리
+
+[일반 조언]
+- 일정 우선순위 조언, 시간 관리 도움, 데드라인 관리
 - 업무와 개인 일정 균형 조언
-- 항상 한국어로 대화하고, 효율적이고 명확하게 답해줘.""",
+
+사용자가 "캘린더 연결됐어?" 같이 물어보면 "네, 구글 캘린더와 연동되어 있어요! `/오늘일정` 이나 `/일정추가`를 써보세요 📅" 라고 안내해줘.
+항상 한국어로 대화하고, 효율적이고 명확하게 답해줘.""",
 
     "default": """너는 정훈의 만능 AI 비서야.
 - 운동, 식단, 번역, 일정, 일반 질문 등 무엇이든 도와줘
@@ -497,8 +511,15 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 # ─── 이벤트 ───────────────────────────────────────────
 @bot.event
 async def on_ready():
-    notion_status  = "✅" if notion else "❌ (NOTION_TOKEN 미설정)"
-    gcal_status    = "✅" if GOOGLE_CALENDAR_ID and GOOGLE_CREDENTIALS_JSON else "❌ (환경변수 미설정)"
+    notion_status = "✅" if notion else "❌ (NOTION_TOKEN 미설정)"
+
+    # 구글 캘린더: 실제 연결 테스트
+    if not GOOGLE_CALENDAR_ID or not GOOGLE_CREDENTIALS_JSON:
+        gcal_status = "❌ (GOOGLE_CALENDAR_ID 또는 GOOGLE_CREDENTIALS_JSON 미설정)"
+    else:
+        gcal_svc = await asyncio.to_thread(_get_calendar_service)
+        gcal_status = "✅" if gcal_svc else "❌ (JSON 파싱 오류 또는 권한 문제 — Railway 로그 확인)"
+
     print(f"✅ {bot.user} 봇 실행 중!")
     print(f"📦 연결된 서버 수: {len(bot.guilds)}")
     print(f"📓 Notion:           {notion_status}")
@@ -612,7 +633,11 @@ async def add_schedule(ctx, *, content: str = None):
                 f"**시간:** {event['start_time']} ~ {event['end_time']}"
             )
         else:
-            await ctx.send("❌ 캘린더 추가 중 오류가 발생했어요.")
+            await ctx.send(
+                "❌ 캘린더 추가 중 오류가 발생했어요.\n"
+                "Railway 로그에서 `[Google Calendar 서비스 오류]` 메시지를 확인해주세요.\n"
+                "(`GOOGLE_CREDENTIALS_JSON` 형식 오류일 가능성이 높아요)"
+            )
 
 @bot.command(name="오늘일정")
 async def today_schedule(ctx):
