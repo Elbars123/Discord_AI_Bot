@@ -130,10 +130,11 @@ SYSTEM_PROMPTS = {
     "일정": """너는 정훈의 전담 일정 관리 비서야. 구글 캘린더와 실제로 연동되어 있어.
 
 [캘린더 연동 기능]
+- 사용자가 일정을 말하면 시스템이 자동으로 캘린더에 추가를 시도해. 별도 커맨드 안내 불필요.
 - `/일정추가 [내용]` — 자연어로 일정을 파싱해서 구글 캘린더에 자동 추가 (예: /일정추가 내일 오후 3시 치과)
 - `/오늘일정` — 오늘 구글 캘린더에 등록된 일정 조회
 - `/이번주일정` — 이번 주 일정 전체 조회
-- 일정 관련 메시지를 보내면 자동으로 캘린더 추가도 시도해줘
+- 사용자가 일정을 말하면 "자동으로 추가해드릴게요!" 식으로 자연스럽게 응대해줘. 커맨드를 복사하라는 안내는 하지 마.
 
 [할일 관리 (Notion 연동)]
 - `/할일추가 [내용]` — Notion 할일 DB에 추가
@@ -652,12 +653,21 @@ def _add_event_sync(title: str, start_dt: str, end_dt: str, description: str = "
     service = _get_calendar_service()
     if not service:
         return False
-    event = {
-        "summary":     title,
-        "description": description,
-        "start": {"dateTime": start_dt, "timeZone": "Asia/Seoul"},
-        "end":   {"dateTime": end_dt,   "timeZone": "Asia/Seoul"},
-    }
+    # 종일 이벤트: start_dt가 날짜(YYYY-MM-DD)만 있는 경우
+    if "T" not in start_dt:
+        event = {
+            "summary":     title,
+            "description": description,
+            "start": {"date": start_dt},
+            "end":   {"date": end_dt},
+        }
+    else:
+        event = {
+            "summary":     title,
+            "description": description,
+            "start": {"dateTime": start_dt, "timeZone": "Asia/Seoul"},
+            "end":   {"dateTime": end_dt,   "timeZone": "Asia/Seoul"},
+        }
     service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
     return True
 
@@ -710,7 +720,12 @@ async def parse_event_from_ai(text: str) -> dict | None:
   "end_time": "HH:MM",
   "description": ""
 }}
-end_time이 불명확하면 start_time + 1시간으로 설정해줘.""",
+규칙:
+- "이번주 토요일" = 이번주 토요일 날짜로 계산해줘 (오늘={today_str} 기준)
+- "이번주 일요일" = 이번주 일요일 날짜로 계산해줘
+- 시간이 없으면 start_time과 end_time을 모두 null로 설정 (종일 이벤트)
+- 시간이 있으면 end_time이 없을 경우 start_time + 1시간으로 설정
+- 일정 제목만 있어도 has_event: true로 처리해줘""",
             messages=[{"role": "user", "content": text}]
         )
         raw = response.content[0].text.strip()
@@ -748,18 +763,6 @@ async def get_ai_response(
     )
     reply = response.content[0].text
     await add_message(channel_id, "assistant", reply)
-
-    # 번역 채널: 실제 번역 결과일 때만 Notion 저장
-    # (병음·한자·알파벳 등 번역 결과 특징적인 문자가 포함된 경우만)
-    if mode == "번역" and notion and NOTION_TRANSLATION_DB_ID:
-        import unicodedata
-        has_cjk    = any(unicodedata.category(c) in ("Lo",) and '\u4e00' <= c <= '\u9fff' for c in reply)
-        has_latin  = any(c.isascii() and c.isalpha() for c in reply)
-        has_korean = any('\uAC00' <= c <= '\uD7A3' for c in user_message)
-        # 원문에 한국어/영어/중국어 있고, 응답에 다른 언어 번역 결과가 보이면 저장
-        is_translation = (has_cjk or has_latin) and len(user_message.strip()) >= 2
-        if is_translation:
-            asyncio.create_task(notion_save_translation(user_message, reply))
 
     return reply
 
@@ -927,8 +930,15 @@ async def on_message(message: discord.Message):
                         and any(kw in user_text for kw in TIME_KEYWORDS)):
                     event = await parse_event_from_ai(user_text)
                     if event:
-                        start_dt = f"{event['date']}T{event['start_time']}:00+09:00"
-                        end_dt   = f"{event['date']}T{event['end_time']}:00+09:00"
+                        allday = not event.get("start_time")
+                        if allday:
+                            start_dt = event["date"]
+                            end_dt   = event["date"]
+                            time_str = "(종일)"
+                        else:
+                            start_dt = f"{event['date']}T{event['start_time']}:00+09:00"
+                            end_dt   = f"{event['date']}T{event['end_time']}:00+09:00"
+                            time_str = f"{event['start_time']}~{event['end_time']}"
                         ok = await calendar_add_event(
                             event["title"], start_dt, end_dt,
                             event.get("description", "")
@@ -937,7 +947,7 @@ async def on_message(message: discord.Message):
                             await message.channel.send(
                                 f"📅 캘린더에 자동 추가했어요!\n"
                                 f"**{event['title']}** — "
-                                f"{event['date']} {event['start_time']}~{event['end_time']}"
+                                f"{event['date']} {time_str}"
                             )
             except Exception as e:
                 await message.channel.send(f"⚠️ 오류 발생: {e}")
@@ -1156,8 +1166,15 @@ async def add_schedule(ctx, *, content: str = None):
                 "예: `/일정추가 2월 25일 오후 2시 회의`"
             )
             return
-        start_dt = f"{event['date']}T{event['start_time']}:00+09:00"
-        end_dt   = f"{event['date']}T{event['end_time']}:00+09:00"
+        allday = not event.get("start_time")
+        if allday:
+            start_dt = event["date"]
+            end_dt   = event["date"]
+            time_str = "(종일)"
+        else:
+            start_dt = f"{event['date']}T{event['start_time']}:00+09:00"
+            end_dt   = f"{event['date']}T{event['end_time']}:00+09:00"
+            time_str = f"{event['start_time']} ~ {event['end_time']}"
         ok = await calendar_add_event(
             event["title"], start_dt, end_dt, event.get("description", "")
         )
@@ -1166,7 +1183,7 @@ async def add_schedule(ctx, *, content: str = None):
                 f"📅 **캘린더 추가 완료!**\n"
                 f"**제목:** {event['title']}\n"
                 f"**날짜:** {event['date']}\n"
-                f"**시간:** {event['start_time']} ~ {event['end_time']}"
+                f"**시간:** {time_str}"
             )
         else:
             await ctx.send(
