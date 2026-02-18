@@ -54,9 +54,9 @@ _last_request: dict[int, float] = {}
 
 # ─── 모델 설정 ────────────────────────────────────────
 MODEL_MAP = {
-    "헬스":    "claude-sonnet-4-6",   # 맥락 기억 + 자연스러운 일지 작성
     "번역":    "claude-sonnet-4-6",   # 번역 품질
     "default": "claude-haiku-4-5-20251001",
+    # 헬스: 일반 대화는 Haiku, /저장 시만 Sonnet 사용 (비용 절감)
 }
 
 # ─── 채널별 시스템 프롬프트 ──────────────────────────
@@ -315,8 +315,12 @@ def _rich_text(text: str) -> list:
 
 # 헬스 기록 자동 불러오기 키워드
 
-async def notion_get_health_logs(days: int = 7) -> str:
-    """Notion 헬스 일지 DB에서 최근 N일 기록 조회 후 텍스트로 반환"""
+async def notion_get_health_logs(days: int = 14, compact: bool = False) -> str:
+    """
+    Notion 헬스 일지 DB에서 최근 N일 기록 조회.
+    compact=True: 코칭 컨텍스트용 압축 요약 (토큰 절감)
+    compact=False: 전체 내용 (상세 확인용)
+    """
     if not notion:
         print("[Notion 헬스 조회] notion 클라이언트 없음")
         return ""
@@ -325,7 +329,7 @@ async def notion_get_health_logs(days: int = 7) -> str:
         return ""
     try:
         since = (date.today() - timedelta(days=days)).isoformat()
-        print(f"[Notion 헬스 조회] DB={NOTION_HEALTH_DB_ID[:8]}... since={since}")
+        print(f"[Notion 헬스 조회] DB={NOTION_HEALTH_DB_ID[:8]}... since={since} compact={compact}")
         res = await notion.databases.query(
             database_id=NOTION_HEALTH_DB_ID,
             filter={"property": "날짜", "date": {"on_or_after": since}},
@@ -334,30 +338,75 @@ async def notion_get_health_logs(days: int = 7) -> str:
         print(f"[Notion 헬스 조회] 결과 수: {len(res['results'])}개")
         if not res["results"]:
             return ""
+
         logs = []
         for page in res["results"]:
             date_obj = page["properties"].get("날짜", {}).get("date") or {}
             log_date = date_obj.get("start", "날짜미상")
 
-            # 1) 페이지 속성의 "내용" rich_text 먼저 시도
-            content_prop = page["properties"].get("내용", {}).get("rich_text", [])
-            content = "".join(r["text"]["content"] for r in content_prop).strip()
+            # 페이지 본문 블록에서 내용 읽기
+            blocks = await notion.blocks.children.list(block_id=page["id"])
+            parts  = []
+            for block in blocks["results"]:
+                btype = block.get("type", "")
+                rich  = block.get(btype, {}).get("rich_text", [])
+                text  = "".join(r["text"]["content"] for r in rich)
+                if text.strip():
+                    parts.append(text)
+            content = "\n".join(parts) if parts else "내용 없음"
 
-            # 2) 속성에 없으면 페이지 본문 블록에서 읽기
-            if not content:
-                blocks = await notion.blocks.children.list(block_id=page["id"])
-                parts  = []
-                for block in blocks["results"]:
-                    btype = block.get("type", "")
-                    rich  = block.get(btype, {}).get("rich_text", [])
-                    text  = "".join(r["text"]["content"] for r in rich)
-                    if text.strip():
-                        parts.append(text)
-                content = "\n".join(parts) if parts else "내용 없음"
+            if compact:
+                # 압축 모드: 고정 포맷 라벨 기반 regex 추출
+                import re as _re
 
-            print(f"[Notion 헬스 조회] {log_date}: {content[:30]}...")
-            logs.append(f"[{log_date}]\n{content}")
-        return "\n\n---\n\n".join(logs)
+                def extract(pattern, text, default=""):
+                    m = _re.search(pattern, text, _re.MULTILINE)
+                    if not m:
+                        return default
+                    val = m.group(1).strip()
+                    # 빈값 / 미기록 / "-" 등 제외
+                    return "" if val in ("", "-", "없음", "미기록", "해당없음") else val
+
+                workout   = extract(r"운동 부위/종목:\s*(.+)", content)
+                weight    = extract(r"무게/세트/횟수:\s*(.+)", content)
+                work_time = extract(r"운동 시간대:\s*(.+)", content)
+                cond      = extract(r"컨디션:\s*(.+)", content)
+                breakfast = extract(r"아침:\s*(.+)", content)
+                lunch     = extract(r"점심:\s*(.+)", content)
+                dinner    = extract(r"저녁:\s*(.+)", content)
+                snack     = extract(r"간식/야식:\s*(.+)", content)
+                notes_raw = _re.findall(r"^-\s+(.+)", content, _re.MULTILINE)
+                notes     = [n.strip() for n in notes_raw if n.strip() and n.strip() != "-"]
+
+                parts_compact = []
+                if workout:
+                    line = f"운동: {workout}"
+                    if weight:
+                        line += f" ({weight})"
+                    if work_time:
+                        line += f" {work_time}"
+                    parts_compact.append(line)
+                if cond:
+                    parts_compact.append(f"컨디션: {cond}")
+
+                meals = []
+                for label, val in [("아침", breakfast), ("점심", lunch), ("저녁", dinner), ("간식", snack)]:
+                    if val:
+                        meals.append(f"{label}-{val}")
+                if meals:
+                    parts_compact.append("식단: " + " | ".join(meals))
+                if notes:
+                    parts_compact.append("특기: " + " / ".join(notes[:2]))  # 최대 2개
+
+                summary = " · ".join(parts_compact) if parts_compact else "기록 있음 (포맷 불일치)"
+                logs.append(f"{log_date}: {summary}")
+            else:
+                logs.append(f"[{log_date}]\n{content}")
+
+            print(f"[Notion 헬스 조회] {log_date} OK")
+
+        sep = "\n" if compact else "\n\n---\n\n"
+        return sep.join(logs)
     except Exception as e:
         print(f"[Notion 헬스 기록 조회 오류] {type(e).__name__}: {e}")
         return ""
@@ -988,14 +1037,17 @@ async def on_message(message: discord.Message):
 
         async with message.channel.typing():
             try:
-                # 헬스 채널: 매 메시지마다 Notion 최근 14일 기록 주입 → Sonnet이 알아서 활용
-                # 단, 히스토리에는 원본 user_text만 저장 (Notion 데이터가 /저장 시 중복 저장되는 것 방지)
-                send_text = user_text  # Claude에 보낼 텍스트 (Notion 포함)
+                # 헬스 채널: 항상 압축 요약 주입 (코칭 품질 유지) + 상세 요청 시 전체 주입
+                # 히스토리에는 원본 user_text만 저장 (Notion 데이터가 /저장 시 중복 저장 방지)
+                DETAIL_KEYWORDS = ("자세히", "전체", "다 보여", "상세", "풀로")
+                send_text = user_text
                 if get_channel_mode(message.channel.name) == "헬스" and notion:
-                    records = await notion_get_health_logs(14)
+                    detail = any(kw in user_text for kw in DETAIL_KEYWORDS)
+                    records = await notion_get_health_logs(14, compact=not detail)
                     if records:
+                        label = "상세 기록" if detail else "요약 (코칭 참고용, 저장 대상 아님)"
                         send_text = (
-                            f"[정훈의 Notion 헬스 기록 (최근 14일) — 코칭 참고용, 저장 대상 아님]\n"
+                            f"[정훈의 Notion 헬스 기록 최근 14일 — {label}]\n"
                             f"{records}\n\n"
                             f"---\n"
                             f"[정훈의 메시지]\n{user_text}"
@@ -1004,7 +1056,7 @@ async def on_message(message: discord.Message):
                 reply = await get_ai_response(
                     message.channel.id,
                     message.channel.name,
-                    send_text,       # Claude에 보내는 건 Notion 포함 버전
+                    send_text,
                     save_message=user_text,  # 히스토리엔 원본만 저장
                 )
                 await send_long_message(message.channel, reply)
