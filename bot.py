@@ -733,6 +733,38 @@ async def on_message(message: discord.Message):
                 delete_after=5
             )
 
+        # ── 메모 저장 트리거 감지 (채널 무관, Claude 재호출 없음) ──
+        MEMO_TRIGGER = ("메모로 저장", "메모 저장", "메모해줘", "메모로 남겨",
+                        "메모 남겨", "메모로 기록", "메모에 저장")
+        if any(kw in user_text for kw in MEMO_TRIGGER):
+            if not notion or not NOTION_MEMO_DB_ID:
+                await message.channel.send("❌ Notion 메모 DB가 설정되지 않았어요. (NOTION_MEMO_DB_ID 확인)")
+            else:
+                hist = await get_history(message.channel.id)
+                last_ai, last_topic = "", ""
+                for msg in reversed(hist):
+                    if msg["role"] == "assistant" and not last_ai:
+                        last_ai = msg["content"]
+                    elif msg["role"] == "user" and last_ai and not last_topic:
+                        last_topic = msg["content"]
+                        break
+                if last_ai:
+                    title   = last_topic[:50] if last_topic else user_text[:50]
+                    content = (f"[질문]\n{last_topic}\n\n[답변]\n{last_ai}"
+                               if last_topic else last_ai)
+                    ok = await notion_save_memo(title, content)
+                    if ok:
+                        await message.channel.send(
+                            f"📝 **메모 저장 완료!**\n제목: **{title}**"
+                        )
+                    else:
+                        await message.channel.send("❌ 메모 저장 실패")
+                else:
+                    await message.channel.send(
+                        "❌ 저장할 대화 내용이 없어요. 먼저 대화를 해주세요!"
+                    )
+            return  # Claude 호출 없이 종료
+
         async with message.channel.typing():
             try:
                 # 헬스 채널: 기록 관련 키워드 감지 → Notion에서 자동 불러오기
