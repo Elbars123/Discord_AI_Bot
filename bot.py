@@ -1,34 +1,55 @@
 import os
 import sqlite3
 import asyncio
+import json
 import discord
 from discord.ext import commands
 from anthropic import AsyncAnthropic
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from notion_client import AsyncClient as NotionAsyncClient
+from dotenv import load_dotenv
+
+# Google Calendar (선택 의존성)
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build as google_build
+    GOOGLE_AVAILABLE = True
+except ImportError:
+    GOOGLE_AVAILABLE = False
+
+load_dotenv()  # 로컬 .env 파일 로드
 
 # ─── 환경변수 유효성 검사 ─────────────────────────────
 REQUIRED_ENV_VARS = ["DISCORD_TOKEN", "ANTHROPIC_API_KEY"]
 missing_vars = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
 if missing_vars:
     raise EnvironmentError(
-        f"❌ 필수 환경변수가 설정되지 않았습니다: {', '.join(missing_vars)}\n"
-        f"   DISCORD_TOKEN, ANTHROPIC_API_KEY 를 환경변수에 등록해주세요."
+        f"❌ 필수 환경변수 누락: {', '.join(missing_vars)}\n"
+        f"   .env 파일 또는 Railway Variables에 등록해주세요."
     )
 
-DISCORD_TOKEN      = os.environ["DISCORD_TOKEN"]
-ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
-NOTION_TOKEN       = os.environ.get("NOTION_TOKEN", "")
-NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
+DISCORD_TOKEN     = os.environ["DISCORD_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-LOG_DIR = "logs"
-DB_PATH = "history.db"
-MAX_HISTORY = 60  # 채널당 보관할 최대 메시지 수
+# 노션
+NOTION_TOKEN             = os.environ.get("NOTION_TOKEN", "")
+NOTION_HEALTH_DB_ID      = os.environ.get("NOTION_HEALTH_DB_ID", "")
+NOTION_TODO_DB_ID        = os.environ.get("NOTION_TODO_DB_ID", "")
+NOTION_TRANSLATION_DB_ID = os.environ.get("NOTION_TRANSLATION_DB_ID", "")
+NOTION_MEMO_DB_ID        = os.environ.get("NOTION_MEMO_DB_ID", "")
+
+# 구글 캘린더
+GOOGLE_CALENDAR_ID      = os.environ.get("GOOGLE_CALENDAR_ID", "")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+
+LOG_DIR     = "logs"
+DB_PATH     = "history.db"
+MAX_HISTORY = 60
 
 # ─── 모델 설정 ────────────────────────────────────────
 MODEL_MAP = {
-    "번역":    "claude-3-5-sonnet-20241022",   # 번역은 고품질 모델
-    "default": "claude-3-5-haiku-20241022",    # 나머지는 빠른 모델
+    "번역":    "claude-sonnet-4-6",
+    "default": "claude-haiku-4-5-20251001",
 }
 
 # ─── 채널별 시스템 프롬프트 ──────────────────────────
@@ -78,9 +99,8 @@ MODE_EMOJI = {
     "default": "🤖",
 }
 
-# ─── SQLite 히스토리 관리 ─────────────────────────────
+# ─── SQLite 히스토리 ──────────────────────────────────
 def init_db():
-    """DB 테이블 초기화 (최초 실행 시 생성)"""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_history (
@@ -92,7 +112,8 @@ def init_db():
             )
         """)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_channel ON conversation_history (channel_id, timestamp)"
+            "CREATE INDEX IF NOT EXISTS idx_channel "
+            "ON conversation_history (channel_id, timestamp)"
         )
         conn.commit()
 
@@ -111,7 +132,6 @@ def _add_message(channel_id: int, role: str, content: str):
             "INSERT INTO conversation_history (channel_id, role, content) VALUES (?, ?, ?)",
             (channel_id, role, content)
         )
-        # MAX_HISTORY 초과분 제거
         conn.execute("""
             DELETE FROM conversation_history
             WHERE channel_id = ?
@@ -126,10 +146,7 @@ def _add_message(channel_id: int, role: str, content: str):
 
 def _clear_history(channel_id: int):
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "DELETE FROM conversation_history WHERE channel_id = ?",
-            (channel_id,)
-        )
+        conn.execute("DELETE FROM conversation_history WHERE channel_id = ?", (channel_id,))
         conn.commit()
 
 def _count_history(channel_id: int) -> int:
@@ -139,7 +156,6 @@ def _count_history(channel_id: int) -> int:
             (channel_id,)
         ).fetchone()[0]
 
-# asyncio에서 블로킹 DB 작업을 별도 스레드로 실행하는 래퍼
 async def get_history(channel_id: int):
     return await asyncio.to_thread(_get_history, channel_id)
 
@@ -149,10 +165,10 @@ async def add_message(channel_id: int, role: str, content: str):
 async def clear_history(channel_id: int):
     await asyncio.to_thread(_clear_history, channel_id)
 
-async def count_history(channel_id: int):
+async def count_history(channel_id: int) -> int:
     return await asyncio.to_thread(_count_history, channel_id)
 
-# ─── 유틸 함수 ───────────────────────────────────────
+# ─── 유틸 ────────────────────────────────────────────
 def get_model(mode: str) -> str:
     return MODEL_MAP.get(mode, MODEL_MAP["default"])
 
@@ -163,18 +179,256 @@ def get_channel_mode(channel_name: str) -> str:
     return "default"
 
 async def send_long_message(target, text: str):
-    """2000자 초과 메시지를 1900자 청크로 분할 전송"""
+    """2000자 초과 메시지 분할 전송"""
     if len(text) <= 1900:
         await target.send(text)
         return
     for i in range(0, len(text), 1900):
         await target.send(text[i:i + 1900])
 
+def _rich_text(text: str) -> list:
+    """Notion rich_text 블록 생성 (2000자 제한 대응)"""
+    return [{"type": "text", "text": {"content": text[:2000]}}]
+
+# ─── Notion: 헬스 일지 ───────────────────────────────
+async def notion_save_health_log(summary: str) -> bool:
+    """헬스 일지를 Notion DB에 저장 (프로퍼티: 이름/날짜/내용)"""
+    if not notion or not NOTION_HEALTH_DB_ID:
+        return False
+    try:
+        today = date.today().isoformat()
+        await notion.pages.create(
+            parent={"database_id": NOTION_HEALTH_DB_ID},
+            properties={
+                "이름": {"title": [{"text": {"content": f"헬스 일지 - {today}"}}]},
+                "날짜": {"date": {"start": today}},
+            },
+            children=[{
+                "object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": _rich_text(summary)},
+            }]
+        )
+        return True
+    except Exception as e:
+        print(f"[Notion 헬스 오류] {e}")
+        return False
+
+# ─── Notion: 할일 ─────────────────────────────────────
+async def notion_add_todo(title: str, due_date: str = "", priority: str = "중간") -> bool:
+    """할일을 Notion DB에 추가 (프로퍼티: 이름/마감일/완료/우선순위)"""
+    if not notion or not NOTION_TODO_DB_ID:
+        return False
+    try:
+        props = {
+            "이름":     {"title": [{"text": {"content": title}}]},
+            "완료":     {"checkbox": False},
+            "우선순위": {"select": {"name": priority}},
+        }
+        if due_date:
+            props["마감일"] = {"date": {"start": due_date}}
+        await notion.pages.create(
+            parent={"database_id": NOTION_TODO_DB_ID},
+            properties=props
+        )
+        return True
+    except Exception as e:
+        print(f"[Notion 할일 추가 오류] {e}")
+        return False
+
+async def notion_get_todos() -> list[dict]:
+    """Notion DB에서 미완료 할일 조회"""
+    if not notion or not NOTION_TODO_DB_ID:
+        return []
+    try:
+        res = await notion.databases.query(
+            database_id=NOTION_TODO_DB_ID,
+            filter={"property": "완료", "checkbox": {"equals": False}},
+            sorts=[{"property": "마감일", "direction": "ascending"}]
+        )
+        todos = []
+        for page in res["results"]:
+            props = page["properties"]
+            title_arr = props.get("이름", {}).get("title", [])
+            title     = title_arr[0]["text"]["content"] if title_arr else "제목없음"
+            due_obj   = props.get("마감일", {}).get("date") or {}
+            due       = due_obj.get("start", "")
+            pri_obj   = props.get("우선순위", {}).get("select") or {}
+            priority  = pri_obj.get("name", "")
+            todos.append({"id": page["id"], "title": title, "due": due, "priority": priority})
+        return todos
+    except Exception as e:
+        print(f"[Notion 할일 조회 오류] {e}")
+        return []
+
+async def notion_complete_todo(title: str) -> bool:
+    """할일 이름으로 검색해 완료 처리"""
+    if not notion or not NOTION_TODO_DB_ID:
+        return False
+    try:
+        res = await notion.databases.query(
+            database_id=NOTION_TODO_DB_ID,
+            filter={
+                "and": [
+                    {"property": "완료", "checkbox": {"equals": False}},
+                    {"property": "이름", "title": {"contains": title}},
+                ]
+            }
+        )
+        if not res["results"]:
+            return False
+        page_id = res["results"][0]["id"]
+        await notion.pages.update(
+            page_id=page_id,
+            properties={"완료": {"checkbox": True}}
+        )
+        return True
+    except Exception as e:
+        print(f"[Notion 할일 완료 오류] {e}")
+        return False
+
+# ─── Notion: 번역 기록 ────────────────────────────────
+async def notion_save_translation(original: str, translated: str) -> bool:
+    """번역 결과를 Notion DB에 자동 저장 (프로퍼티: 원문/번역/날짜)"""
+    if not notion or not NOTION_TRANSLATION_DB_ID:
+        return False
+    try:
+        today = date.today().isoformat()
+        await notion.pages.create(
+            parent={"database_id": NOTION_TRANSLATION_DB_ID},
+            properties={
+                "원문": {"title": [{"text": {"content": original[:100]}}]},
+                "번역": {"rich_text": _rich_text(translated)},
+                "날짜": {"date": {"start": today}},
+            },
+            children=[
+                {"object": "block", "type": "paragraph",
+                 "paragraph": {"rich_text": _rich_text(f"[원문]\n{original}")}},
+                {"object": "block", "type": "paragraph",
+                 "paragraph": {"rich_text": _rich_text(f"[번역]\n{translated}")}},
+            ]
+        )
+        return True
+    except Exception as e:
+        print(f"[Notion 번역 저장 오류] {e}")
+        return False
+
+# ─── Notion: 메모 ─────────────────────────────────────
+async def notion_save_memo(title: str, content: str) -> bool:
+    """메모를 Notion DB에 저장 (프로퍼티: 제목/내용/날짜)"""
+    if not notion or not NOTION_MEMO_DB_ID:
+        return False
+    try:
+        today = date.today().isoformat()
+        await notion.pages.create(
+            parent={"database_id": NOTION_MEMO_DB_ID},
+            properties={
+                "제목": {"title": [{"text": {"content": title}}]},
+                "내용": {"rich_text": _rich_text(content)},
+                "날짜": {"date": {"start": today}},
+            }
+        )
+        return True
+    except Exception as e:
+        print(f"[Notion 메모 저장 오류] {e}")
+        return False
+
+# ─── Google Calendar ──────────────────────────────────
+def _get_calendar_service():
+    if not GOOGLE_AVAILABLE or not GOOGLE_CREDENTIALS_JSON or not GOOGLE_CALENDAR_ID:
+        return None
+    try:
+        creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/calendar"]
+        )
+        return google_build("calendar", "v3", credentials=creds)
+    except Exception as e:
+        print(f"[Google Calendar 서비스 오류] {e}")
+        return None
+
+def _add_event_sync(title: str, start_dt: str, end_dt: str, description: str = "") -> bool:
+    service = _get_calendar_service()
+    if not service:
+        return False
+    event = {
+        "summary":     title,
+        "description": description,
+        "start": {"dateTime": start_dt, "timeZone": "Asia/Seoul"},
+        "end":   {"dateTime": end_dt,   "timeZone": "Asia/Seoul"},
+    }
+    service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+    return True
+
+def _get_events_sync(time_min: str, time_max: str) -> list[dict]:
+    service = _get_calendar_service()
+    if not service:
+        return []
+    result = service.events().list(
+        calendarId=GOOGLE_CALENDAR_ID,
+        timeMin=time_min,
+        timeMax=time_max,
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute()
+    events = []
+    for e in result.get("items", []):
+        start = e["start"].get("dateTime", e["start"].get("date", ""))
+        events.append({"title": e.get("summary", "제목없음"), "start": start})
+    return events
+
+async def calendar_add_event(title: str, start_dt: str, end_dt: str, description: str = "") -> bool:
+    try:
+        return await asyncio.to_thread(_add_event_sync, title, start_dt, end_dt, description)
+    except Exception as e:
+        print(f"[Google Calendar 추가 오류] {e}")
+        return False
+
+async def calendar_get_events(time_min: str, time_max: str) -> list[dict]:
+    try:
+        return await asyncio.to_thread(_get_events_sync, time_min, time_max)
+    except Exception as e:
+        print(f"[Google Calendar 조회 오류] {e}")
+        return []
+
+async def parse_event_from_ai(text: str) -> dict | None:
+    """Claude로 자연어 → 일정 정보(JSON) 추출"""
+    today_str = date.today().isoformat()
+    try:
+        response = await anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=f"""너는 일정 파싱 전문가야. 오늘 날짜는 {today_str}이야.
+사용자 메시지에서 캘린더에 추가할 일정 정보를 추출해서 아래 JSON 형식으로만 답해줘.
+일정 정보가 없으면 {{"has_event": false}} 로만 답해줘.
+{{
+  "has_event": true,
+  "title": "일정 제목",
+  "date": "YYYY-MM-DD",
+  "start_time": "HH:MM",
+  "end_time": "HH:MM",
+  "description": ""
+}}
+end_time이 불명확하면 start_time + 1시간으로 설정해줘.""",
+            messages=[{"role": "user", "content": text}]
+        )
+        raw = response.content[0].text.strip()
+        # ```json ... ``` 형식 대응
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
+        return data if data.get("has_event") else None
+    except Exception as e:
+        print(f"[일정 파싱 오류] {e}")
+        return None
+
 # ─── AI 응답 ─────────────────────────────────────────
 async def get_ai_response(channel_id: int, channel_name: str, user_message: str) -> str:
     await add_message(channel_id, "user", user_message)
     history = await get_history(channel_id)
-    mode = get_channel_mode(channel_name)
+    mode    = get_channel_mode(channel_name)
 
     response = await anthropic.messages.create(
         model=get_model(mode),
@@ -184,13 +438,17 @@ async def get_ai_response(channel_id: int, channel_name: str, user_message: str)
     )
     reply = response.content[0].text
     await add_message(channel_id, "assistant", reply)
+
+    # 번역 채널: 자동으로 Notion 번역 기록 저장
+    if mode == "번역":
+        asyncio.create_task(notion_save_translation(user_message, reply))
+
     return reply
 
 async def generate_summary(channel_id: int, channel_name: str) -> str:
     history = await get_history(channel_id)
     if not history:
         return "대화 내용이 없어요!"
-
     mode = get_channel_mode(channel_name)
     summary_prompts = {
         "헬스": (
@@ -201,7 +459,6 @@ async def generate_summary(channel_id: int, channel_name: str) -> str:
         "일정": "오늘 일정 대화 내용을 정리해줘. 완료한 일, 남은 할일, 내일 계획 순서로.",
     }
     summary_request = summary_prompts.get(mode, "오늘 대화 내용을 간단히 요약해줘.")
-
     response = await anthropic.messages.create(
         model=get_model(mode),
         max_tokens=1024,
@@ -210,16 +467,15 @@ async def generate_summary(channel_id: int, channel_name: str) -> str:
     )
     return response.content[0].text
 
-# ─── 저장 ─────────────────────────────────────────────
+# ─── 파일 저장 ────────────────────────────────────────
 def _write_file(filename: str, content: str):
-    """파일을 안전하게 with 블록으로 저장 (블로킹 → to_thread로 호출)"""
     with open(filename, "w", encoding="utf-8") as f:
         f.write(content)
 
 async def save_to_file(channel_name: str, summary: str) -> str:
-    today = date.today().isoformat()
+    today    = date.today().isoformat()
     filename = f"{LOG_DIR}/{today}_{channel_name}.md"
-    content = (
+    content  = (
         f"# {channel_name} 일지 - {today}\n\n"
         f"{summary}\n\n"
         f"---\n*저장 시각: {datetime.now().strftime('%H:%M:%S')}*\n"
@@ -227,38 +483,12 @@ async def save_to_file(channel_name: str, summary: str) -> str:
     await asyncio.to_thread(_write_file, filename, content)
     return filename
 
-async def save_to_notion(channel_name: str, summary: str) -> bool:
-    if not notion or not NOTION_DATABASE_ID:
-        return False
-    try:
-        today = date.today().isoformat()
-        await notion.pages.create(
-            parent={"database_id": NOTION_DATABASE_ID},
-            properties={
-                "title": {
-                    "title": [{"text": {"content": f"{channel_name} 일지 - {today}"}}]
-                },
-                "Date": {"date": {"start": today}},
-            },
-            children=[{
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": summary}}]
-                },
-            }],
-        )
-        return True
-    except Exception as e:
-        print(f"[Notion 오류] {e}")
-        return False
-
 # ─── 초기화 ───────────────────────────────────────────
 os.makedirs(LOG_DIR, exist_ok=True)
 init_db()
 
 anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-notion = NotionAsyncClient(auth=NOTION_TOKEN) if NOTION_TOKEN else None
+notion    = NotionAsyncClient(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -267,14 +497,18 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 # ─── 이벤트 ───────────────────────────────────────────
 @bot.event
 async def on_ready():
+    notion_status  = "✅" if notion else "❌ (NOTION_TOKEN 미설정)"
+    gcal_status    = "✅" if GOOGLE_CALENDAR_ID and GOOGLE_CREDENTIALS_JSON else "❌ (환경변수 미설정)"
     print(f"✅ {bot.user} 봇 실행 중!")
     print(f"📦 연결된 서버 수: {len(bot.guilds)}")
+    print(f"📓 Notion:           {notion_status}")
+    print(f"📅 Google Calendar:  {gcal_status}")
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    # DM 채널은 name 속성이 없으므로 무시
+    # DM 채널 무시 (name 속성 없음)
     if not isinstance(message.channel, discord.TextChannel):
         return
     await bot.process_commands(message)
@@ -287,33 +521,51 @@ async def on_message(message: discord.Message):
                     message.content,
                 )
                 await send_long_message(message.channel, reply)
+
+                # 일정 채널: 자연어에서 일정 자동 감지 → 캘린더 추가
+                if get_channel_mode(message.channel.name) == "일정" and GOOGLE_CALENDAR_ID:
+                    event = await parse_event_from_ai(message.content)
+                    if event:
+                        start_dt = f"{event['date']}T{event['start_time']}:00+09:00"
+                        end_dt   = f"{event['date']}T{event['end_time']}:00+09:00"
+                        ok = await calendar_add_event(
+                            event["title"], start_dt, end_dt,
+                            event.get("description", "")
+                        )
+                        if ok:
+                            await message.channel.send(
+                                f"📅 캘린더에 자동 추가했어요!\n"
+                                f"**{event['title']}** — "
+                                f"{event['date']} {event['start_time']}~{event['end_time']}"
+                            )
             except Exception as e:
                 await message.channel.send(f"⚠️ 오류 발생: {e}")
 
-# ─── 커맨드 ───────────────────────────────────────────
+# ─── 기본 커맨드 ──────────────────────────────────────
 @bot.command(name="저장")
 async def save_log(ctx):
-    """오늘 대화를 요약해 파일 & 노션에 저장합니다."""
+    """오늘 대화를 AI가 요약해 파일 & Notion에 저장"""
     async with ctx.typing():
         summary  = await generate_summary(ctx.channel.id, ctx.channel.name)
         filename = await save_to_file(ctx.channel.name, summary)
-        notion_ok = await save_to_notion(ctx.channel.name, summary)
+        result   = f"📝 **일지 저장 완료!**\n\n{summary}\n\n✅ 파일: `{filename}`\n"
 
-        result = f"📝 **일지 저장 완료!**\n\n{summary}\n\n✅ 파일: `{filename}`\n"
-        if notion_ok:
-            result += "✅ 노션 저장 완료!\n"
+        # 헬스 채널: Notion 헬스 일지 DB에도 저장
+        if get_channel_mode(ctx.channel.name) == "헬스":
+            if await notion_save_health_log(summary):
+                result += "✅ Notion 헬스 일지 저장 완료!\n"
 
         await send_long_message(ctx, result)
 
 @bot.command(name="초기화")
 async def reset_history(ctx):
-    """이 채널의 대화 히스토리를 삭제합니다."""
+    """이 채널의 대화 히스토리를 삭제"""
     await clear_history(ctx.channel.id)
     await ctx.send("🔄 이 채널의 대화 히스토리를 초기화했어요!")
 
 @bot.command(name="히스토리")
 async def show_history(ctx):
-    """현재 채널의 저장된 대화 수를 보여줍니다."""
+    """현재 채널의 저장된 대화 수 확인"""
     count = await count_history(ctx.channel.id)
     turns = count // 2
     await ctx.send(
@@ -323,28 +575,195 @@ async def show_history(ctx):
 
 @bot.command(name="모드")
 async def show_mode(ctx):
-    """현재 채널의 AI 모드를 확인합니다."""
-    mode = get_channel_mode(ctx.channel.name)
+    """현재 채널의 AI 모드 및 사용 모델 확인"""
+    mode  = get_channel_mode(ctx.channel.name)
     emoji = MODE_EMOJI.get(mode, "🤖")
     await ctx.send(f"{emoji} 현재 채널 모드: **{mode}**\n🧠 사용 모델: `{get_model(mode)}`")
 
+# ─── 일정 커맨드 ──────────────────────────────────────
+@bot.command(name="일정추가")
+async def add_schedule(ctx, *, content: str = None):
+    """자연어로 구글 캘린더에 일정 추가. 예: /일정추가 내일 오후 3시 치과"""
+    if not content:
+        await ctx.send("❌ 내용을 입력해주세요.\n예: `/일정추가 내일 오후 3시 치과 예약`")
+        return
+    if not GOOGLE_CALENDAR_ID:
+        await ctx.send("❌ Google Calendar가 설정되지 않았어요. (환경변수 확인)")
+        return
+    async with ctx.typing():
+        event = await parse_event_from_ai(content)
+        if not event:
+            await ctx.send(
+                "❌ 일정 정보를 파악하지 못했어요.\n"
+                "날짜와 시간을 포함해서 다시 입력해주세요.\n"
+                "예: `/일정추가 2월 25일 오후 2시 회의`"
+            )
+            return
+        start_dt = f"{event['date']}T{event['start_time']}:00+09:00"
+        end_dt   = f"{event['date']}T{event['end_time']}:00+09:00"
+        ok = await calendar_add_event(
+            event["title"], start_dt, end_dt, event.get("description", "")
+        )
+        if ok:
+            await ctx.send(
+                f"📅 **캘린더 추가 완료!**\n"
+                f"**제목:** {event['title']}\n"
+                f"**날짜:** {event['date']}\n"
+                f"**시간:** {event['start_time']} ~ {event['end_time']}"
+            )
+        else:
+            await ctx.send("❌ 캘린더 추가 중 오류가 발생했어요.")
+
+@bot.command(name="오늘일정")
+async def today_schedule(ctx):
+    """오늘 구글 캘린더 일정 조회"""
+    if not GOOGLE_CALENDAR_ID:
+        await ctx.send("❌ Google Calendar가 설정되지 않았어요.")
+        return
+    async with ctx.typing():
+        today    = date.today()
+        time_min = f"{today.isoformat()}T00:00:00+09:00"
+        time_max = f"{today.isoformat()}T23:59:59+09:00"
+        events   = await calendar_get_events(time_min, time_max)
+        if not events:
+            await ctx.send(f"📅 오늘 ({today.isoformat()}) 등록된 일정이 없어요!")
+            return
+        lines = [f"📅 **오늘 ({today.isoformat()}) 일정**\n"]
+        for e in events:
+            time_str = e["start"][11:16] if "T" in e["start"] else "(종일)"
+            lines.append(f"• {time_str} — {e['title']}")
+        await ctx.send("\n".join(lines))
+
+@bot.command(name="이번주일정")
+async def week_schedule(ctx):
+    """이번 주 구글 캘린더 일정 조회"""
+    if not GOOGLE_CALENDAR_ID:
+        await ctx.send("❌ Google Calendar가 설정되지 않았어요.")
+        return
+    async with ctx.typing():
+        today    = date.today()
+        week_end = today + timedelta(days=7)
+        time_min = f"{today.isoformat()}T00:00:00+09:00"
+        time_max = f"{week_end.isoformat()}T23:59:59+09:00"
+        events   = await calendar_get_events(time_min, time_max)
+        if not events:
+            await ctx.send("📅 이번 주 등록된 일정이 없어요!")
+            return
+        lines = [f"📅 **이번 주 일정 ({today} ~ {week_end})**\n"]
+        for e in events:
+            if "T" in e["start"]:
+                day      = e["start"][:10]
+                time_str = e["start"][11:16]
+                lines.append(f"• {day} {time_str} — {e['title']}")
+            else:
+                lines.append(f"• {e['start']} (종일) — {e['title']}")
+        await send_long_message(ctx, "\n".join(lines))
+
+# ─── 할일 커맨드 ──────────────────────────────────────
+@bot.command(name="할일추가")
+async def add_todo_cmd(ctx, *, content: str = None):
+    """Notion 할일 DB에 할일 추가. 예: /할일추가 보고서 작성"""
+    if not content:
+        await ctx.send("❌ 할일 내용을 입력해주세요.\n예: `/할일추가 보고서 작성`")
+        return
+    if not NOTION_TODO_DB_ID:
+        await ctx.send("❌ Notion 할일 DB가 설정되지 않았어요. (NOTION_TODO_DB_ID 확인)")
+        return
+    ok = await notion_add_todo(content)
+    if ok:
+        await ctx.send(f"✅ 할일 추가 완료!\n**{content}**")
+    else:
+        await ctx.send("❌ 할일 추가 중 오류가 발생했어요.")
+
+@bot.command(name="할일목록")
+async def list_todos_cmd(ctx):
+    """Notion DB에서 미완료 할일 목록 조회"""
+    if not NOTION_TODO_DB_ID:
+        await ctx.send("❌ Notion 할일 DB가 설정되지 않았어요.")
+        return
+    async with ctx.typing():
+        todos = await notion_get_todos()
+        if not todos:
+            await ctx.send("✅ 미완료 할일이 없어요! 모두 완료했나요? 🎉")
+            return
+        priority_emoji = {"높음": "🔴", "중간": "🟡", "낮음": "🟢"}
+        lines = ["**📋 미완료 할일 목록**\n"]
+        for i, todo in enumerate(todos, 1):
+            emoji    = priority_emoji.get(todo["priority"], "⬜")
+            due_str  = f" | 마감: {todo['due']}" if todo["due"] else ""
+            lines.append(f"{i}. {emoji} {todo['title']}{due_str}")
+        await send_long_message(ctx, "\n".join(lines))
+
+@bot.command(name="할일완료")
+async def complete_todo_cmd(ctx, *, title: str = None):
+    """Notion 할일 완료 처리. 예: /할일완료 보고서 작성"""
+    if not title:
+        await ctx.send("❌ 완료할 할일 이름을 입력해주세요.\n예: `/할일완료 보고서 작성`")
+        return
+    if not NOTION_TODO_DB_ID:
+        await ctx.send("❌ Notion 할일 DB가 설정되지 않았어요.")
+        return
+    ok = await notion_complete_todo(title)
+    if ok:
+        await ctx.send(f"✅ **{title}** 완료 처리했어요! 수고했어요 🎉")
+    else:
+        await ctx.send(f"❌ '{title}' 할일을 찾지 못했어요. 이름을 다시 확인해주세요.")
+
+# ─── 메모 커맨드 ──────────────────────────────────────
+@bot.command(name="메모")
+async def save_memo_cmd(ctx, *, content: str = None):
+    """Notion 메모 DB에 저장. 예: /메모 제목 | 내용 (| 없으면 전체가 제목)"""
+    if not content:
+        await ctx.send("❌ 메모 내용을 입력해주세요.\n예: `/메모 아이디어 | 내용을 여기에`")
+        return
+    if not NOTION_MEMO_DB_ID:
+        await ctx.send("❌ Notion 메모 DB가 설정되지 않았어요. (NOTION_MEMO_DB_ID 확인)")
+        return
+    if "|" in content:
+        parts = content.split("|", 1)
+        title = parts[0].strip()
+        body  = parts[1].strip()
+    else:
+        title = content[:50]
+        body  = content
+    ok = await notion_save_memo(title, body)
+    if ok:
+        await ctx.send(f"📝 메모 저장 완료!\n**{title}**")
+    else:
+        await ctx.send("❌ 메모 저장 중 오류가 발생했어요.")
+
+# ─── 도움말 ───────────────────────────────────────────
 @bot.command(name="도움말")
 async def help_command(ctx):
-    """봇 사용법을 출력합니다."""
+    """봇 전체 사용법 출력"""
     help_text = """**🤖 AI 비서 봇 사용법**
 
-**채널별 자동 모드:**
-`#헬스` → 운동 코치 + 식단 어드바이저 모드 💪
-`#번역` → 번역 모드 🌏 (고품질 Sonnet 모델)
-`#일정` → 일정 관리 모드 📅
+**📺 채널별 자동 모드:**
+`#헬스` → 운동 코치 + 식단 어드바이저 💪 (저장 시 Notion 헬스 일지 저장)
+`#번역` → 번역 모드 🌏 (번역할 때마다 Notion 자동 저장)
+`#일정` → 일정 관리 모드 📅 (일정 언급 시 캘린더 자동 추가)
 그 외 채널 → 만능 비서 모드 🤖
 
-**커맨드:**
-`/저장` — 오늘 대화 AI 요약 후 파일 & 노션 저장
+**⚙️ 기본 커맨드:**
+`/저장` — 오늘 대화 AI 요약 후 파일 & Notion 저장
 `/초기화` — 이 채널 대화 히스토리 삭제
 `/히스토리` — 현재 저장된 대화 수 확인
 `/모드` — 현재 채널 모드 및 사용 모델 확인
+
+**📅 일정 커맨드:**
+`/일정추가 [내용]` — AI가 파싱해서 구글 캘린더에 추가
+`/오늘일정` — 오늘 구글 캘린더 일정 조회
+`/이번주일정` — 이번 주 일정 조회
+
+**✅ 할일 커맨드:**
+`/할일추가 [내용]` — Notion 할일 DB에 추가
+`/할일목록` — 미완료 할일 목록 조회
+`/할일완료 [할일명]` — 해당 할일 완료 처리
+
+**📝 메모 커맨드:**
+`/메모 [제목] | [내용]` — Notion 메모 DB에 저장
+
 `/도움말` — 이 메시지"""
-    await ctx.send(help_text)
+    await send_long_message(ctx, help_text)
 
 bot.run(DISCORD_TOKEN)
