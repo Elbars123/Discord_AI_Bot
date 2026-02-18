@@ -480,28 +480,35 @@ async def notion_save_health_text(preview_text: str) -> tuple[int, list[str], li
             existing = res["results"]
 
             if existing:
+                # UPDATE: 제목만 업데이트하고 기존 블록 삭제 후 새 블록 추가
                 page_id = existing[0]["id"]
                 await notion.pages.update(
                     page_id=page_id,
                     properties={
                         "이름": {"title": [{"text": {"content": f"헬스 일지 - {log_date}"}}]},
-                        "내용": {"rich_text": _rich_text(block)},
                     }
+                )
+                # 기존 블록 삭제 후 새 내용으로 교체
+                old_blocks = await notion.blocks.children.list(block_id=page_id)
+                for b in old_blocks["results"]:
+                    await notion.blocks.delete(block_id=b["id"])
+                await notion.blocks.children.append(
+                    block_id=page_id,
+                    children=[{"object": "block", "type": "paragraph",
+                               "paragraph": {"rich_text": _rich_text(block)}}]
                 )
                 updated_dates.append(log_date)
                 print(f"[Notion 헬스 일지 업데이트] {log_date}")
             else:
+                # CREATE: 이름 + 날짜만 속성으로, 내용은 본문 블록으로
                 await notion.pages.create(
                     parent={"database_id": NOTION_HEALTH_DB_ID},
                     properties={
                         "이름": {"title": [{"text": {"content": f"헬스 일지 - {log_date}"}}]},
                         "날짜": {"date": {"start": log_date}},
-                        "내용": {"rich_text": _rich_text(block)},
                     },
-                    children=[{
-                        "object": "block", "type": "paragraph",
-                        "paragraph": {"rich_text": _rich_text(block)},
-                    }]
+                    children=[{"object": "block", "type": "paragraph",
+                               "paragraph": {"rich_text": _rich_text(block)}}]
                 )
                 created_dates.append(log_date)
                 print(f"[Notion 헬스 일지 생성] {log_date}")
@@ -623,9 +630,10 @@ async def notion_save_memo(title: str, content: str) -> bool:
             parent={"database_id": NOTION_MEMO_DB_ID},
             properties={
                 "제목": {"title": [{"text": {"content": title}}]},
-                "내용": {"rich_text": _rich_text(content)},
                 "날짜": {"date": {"start": today}},
-            }
+            },
+            children=[{"object": "block", "type": "paragraph",
+                       "paragraph": {"rich_text": _rich_text(content)}}]
         )
         return True
     except Exception as e:
@@ -675,18 +683,26 @@ async def notion_update_memo(title: str, new_title: str = "", new_content: str =
         props = {}
         if new_title:
             props["제목"] = {"title": [{"text": {"content": new_title}}]}
-        if new_content:
-            props["내용"] = {"rich_text": _rich_text(new_content)}
-        if not props:
+        if not props and not new_content:
             return False
-        await notion.pages.update(page_id=page_id, properties=props)
+        if props:
+            await notion.pages.update(page_id=page_id, properties=props)
+        if new_content:
+            old_blocks = await notion.blocks.children.list(block_id=page_id)
+            for b in old_blocks["results"]:
+                await notion.blocks.delete(block_id=b["id"])
+            await notion.blocks.children.append(
+                block_id=page_id,
+                children=[{"object": "block", "type": "paragraph",
+                           "paragraph": {"rich_text": _rich_text(new_content)}}]
+            )
         return True
     except Exception as e:
         print(f"[Notion 메모 수정 오류] {e}")
         return False
 
 async def notion_update_health_log(date_str: str, new_content: str) -> bool:
-    """날짜로 헬스 기록 검색해 내용 수정"""
+    """날짜로 헬스 기록 검색해 내용 수정 (본문 블록 교체)"""
     if not notion or not NOTION_HEALTH_DB_ID:
         return False
     try:
@@ -697,9 +713,14 @@ async def notion_update_health_log(date_str: str, new_content: str) -> bool:
         if not res["results"]:
             return False
         page_id = res["results"][0]["id"]
-        await notion.pages.update(
-            page_id=page_id,
-            properties={"내용": {"rich_text": _rich_text(new_content)}}
+        # 기존 블록 삭제 후 새 내용으로 교체
+        old_blocks = await notion.blocks.children.list(block_id=page_id)
+        for b in old_blocks["results"]:
+            await notion.blocks.delete(block_id=b["id"])
+        await notion.blocks.children.append(
+            block_id=page_id,
+            children=[{"object": "block", "type": "paragraph",
+                       "paragraph": {"rich_text": _rich_text(new_content)}}]
         )
         return True
     except Exception as e:
@@ -799,10 +820,19 @@ end_time이 불명확하면 start_time + 1시간으로 설정해줘.""",
         return None
 
 # ─── AI 응답 ─────────────────────────────────────────
-async def get_ai_response(channel_id: int, channel_name: str, user_message: str) -> str:
-    await add_message(channel_id, "user", user_message)
+async def get_ai_response(
+    channel_id: int,
+    channel_name: str,
+    user_message: str,
+    save_message: str | None = None,   # 히스토리에 저장할 텍스트 (None이면 user_message 그대로)
+) -> str:
+    # 히스토리엔 원본 메시지만 저장 (Notion 주입 데이터 제외)
+    await add_message(channel_id, "user", save_message if save_message is not None else user_message)
     history = await get_history(channel_id)
     mode    = get_channel_mode(channel_name)
+    # Claude에게 보내는 마지막 메시지는 injected_text (Notion 포함 버전)로 교체
+    if save_message is not None and history and history[-1]["content"] == save_message:
+        history = history[:-1] + [{"role": "user", "content": user_message}]
 
     response = await anthropic.messages.create(
         model=get_model(mode),
@@ -959,12 +989,13 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             try:
                 # 헬스 채널: 매 메시지마다 Notion 최근 14일 기록 주입 → Sonnet이 알아서 활용
-                injected_text = user_text
+                # 단, 히스토리에는 원본 user_text만 저장 (Notion 데이터가 /저장 시 중복 저장되는 것 방지)
+                send_text = user_text  # Claude에 보낼 텍스트 (Notion 포함)
                 if get_channel_mode(message.channel.name) == "헬스" and notion:
                     records = await notion_get_health_logs(14)
                     if records:
-                        injected_text = (
-                            f"[정훈의 Notion 헬스 기록 (최근 14일)]\n"
+                        send_text = (
+                            f"[정훈의 Notion 헬스 기록 (최근 14일) — 코칭 참고용, 저장 대상 아님]\n"
                             f"{records}\n\n"
                             f"---\n"
                             f"[정훈의 메시지]\n{user_text}"
@@ -973,7 +1004,8 @@ async def on_message(message: discord.Message):
                 reply = await get_ai_response(
                     message.channel.id,
                     message.channel.name,
-                    injected_text,
+                    send_text,       # Claude에 보내는 건 Notion 포함 버전
+                    save_message=user_text,  # 히스토리엔 원본만 저장
                 )
                 await send_long_message(message.channel, reply)
 
