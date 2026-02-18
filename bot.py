@@ -42,9 +42,14 @@ NOTION_MEMO_DB_ID        = os.environ.get("NOTION_MEMO_DB_ID", "")
 GOOGLE_CALENDAR_ID      = os.environ.get("GOOGLE_CALENDAR_ID", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 
-LOG_DIR     = "logs"
-DB_PATH     = "history.db"
-MAX_HISTORY = 60
+LOG_DIR      = "logs"
+DB_PATH      = "history.db"
+MAX_HISTORY  = 60
+MAX_MSG_LEN  = 1000   # 입력 메시지 최대 길이 (초과 시 잘라냄)
+COOLDOWN_SEC = 5      # 유저당 최소 요청 간격 (초)
+
+# 레이트 리밋: {user_id: last_request_time}
+_last_request: dict[int, float] = {}
 
 # ─── 모델 설정 ────────────────────────────────────────
 MODEL_MAP = {
@@ -584,18 +589,47 @@ async def on_message(message: discord.Message):
         return
     await bot.process_commands(message)
     if not message.content.startswith("/"):
+
+        # ── 레이트 리밋 체크 ──────────────────────────────
+        import time
+        now = time.monotonic()
+        last = _last_request.get(message.author.id, 0)
+        remaining = COOLDOWN_SEC - (now - last)
+        if remaining > 0:
+            await message.channel.send(
+                f"⏳ {message.author.mention} 너무 빠르게 요청하고 있어요! "
+                f"**{remaining:.1f}초** 후에 다시 시도해주세요.",
+                delete_after=remaining + 1
+            )
+            return
+        _last_request[message.author.id] = now
+
+        # ── 메시지 길이 제한 ──────────────────────────────
+        user_text = message.content
+        if len(user_text) > MAX_MSG_LEN:
+            user_text = user_text[:MAX_MSG_LEN]
+            await message.channel.send(
+                f"⚠️ 메시지가 너무 길어서 앞 {MAX_MSG_LEN}자만 처리했어요.",
+                delete_after=5
+            )
+
         async with message.channel.typing():
             try:
                 reply = await get_ai_response(
                     message.channel.id,
                     message.channel.name,
-                    message.content,
+                    user_text,
                 )
                 await send_long_message(message.channel, reply)
 
-                # 일정 채널: 자연어에서 일정 자동 감지 → 캘린더 추가
-                if get_channel_mode(message.channel.name) == "일정" and GOOGLE_CALENDAR_ID:
-                    event = await parse_event_from_ai(message.content)
+                # 일정 채널: 시간 관련 키워드 있을 때만 일정 파싱 (이중 API 호출 방지)
+                TIME_KEYWORDS = ("오전", "오후", "시", "분", "내일", "모레", "다음주",
+                                 "월요일", "화요일", "수요일", "목요일", "금요일",
+                                 "토요일", "일요일", "월", "일", "날")
+                if (get_channel_mode(message.channel.name) == "일정"
+                        and GOOGLE_CALENDAR_ID
+                        and any(kw in user_text for kw in TIME_KEYWORDS)):
+                    event = await parse_event_from_ai(user_text)
                     if event:
                         start_dt = f"{event['date']}T{event['start_time']}:00+09:00"
                         end_dt   = f"{event['date']}T{event['end_time']}:00+09:00"
