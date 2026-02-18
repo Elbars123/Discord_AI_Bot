@@ -806,7 +806,7 @@ async def get_ai_response(channel_id: int, channel_name: str, user_message: str)
 
     response = await anthropic.messages.create(
         model=get_model(mode),
-        max_tokens=1024,
+        max_tokens=2048,
         system=SYSTEM_PROMPTS[mode],
         messages=history,
     )
@@ -865,7 +865,7 @@ async def generate_summary(channel_id: int, channel_name: str) -> str:
 
     response = await anthropic.messages.create(
         model=get_model(mode),
-        max_tokens=1024,
+        max_tokens=2048,
         temperature=0,
         system=SYSTEM_PROMPTS[mode],
         messages=history + [{"role": "user", "content": summary_request}],
